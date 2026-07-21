@@ -11,9 +11,14 @@
     throw new Error("PangLive must run unsandboxed");
   }
 
-  const WS_BASE = "wss://logiseonlineservices.arielcapdevila.com";
+  const PEERJS_CDN =
+    "https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js";
+  const PEER_ID_PREFIX = "panglive-";
   const STAGE_NAME = "__PangLiveStage__";
   const CHUNK_SIZE = 12000;
+  const CURSOR_ICON =
+    "https://logise1.github.io/static/790c78d39fd853ae72167411aa11d727.svg";
+  const CURSOR_THROTTLE_MS = 50;
   const vm = Scratch.vm;
   const runtime = vm.runtime;
 
@@ -95,6 +100,317 @@
     return `hsl(${hue}, 65%, 45%)`;
   }
 
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  const remoteCursors = new Map();
+  let cursorLayer = null;
+  let cursorTracking = false;
+  let lastCursorSend = 0;
+  let cursorWasOverBlocks = false;
+  let lastLocalCursorTarget = "";
+
+  function getBlocksEl() {
+    return document.querySelector(
+      '[class*="blocks_blocks_"], [class^="gui_blocks-wrapper"]'
+    );
+  }
+
+  function currentCursorTarget() {
+    return targetName(vm.editingTarget);
+  }
+
+  function getBlockCanvas() {
+    const ws = getWorkspace();
+    if (!ws) return null;
+    if (typeof ws.getCanvas === "function") return ws.getCanvas();
+    return ws.svgBlockCanvas_ || null;
+  }
+
+  function pointerToWorkspace(clientX, clientY) {
+    const blocks = getBlocksEl();
+    if (!blocks) return null;
+    const rect = blocks.getBoundingClientRect();
+    if (
+      rect.width <= 0 ||
+      rect.height <= 0 ||
+      clientX < rect.left ||
+      clientX > rect.right ||
+      clientY < rect.top ||
+      clientY > rect.bottom
+    ) {
+      return null;
+    }
+    const canvas = getBlockCanvas();
+    const svg = canvas && canvas.ownerSVGElement;
+    if (canvas && svg && canvas.getScreenCTM) {
+      try {
+        const ctm = canvas.getScreenCTM();
+        if (ctm) {
+          const pt = svg.createSVGPoint();
+          pt.x = clientX;
+          pt.y = clientY;
+          const local = pt.matrixTransform(ctm.inverse());
+          return { x: local.x, y: local.y };
+        }
+      } catch {
+        
+      }
+    }
+    const ws = getWorkspace();
+    if (ws && typeof ws.scale === "number") {
+      return {
+        x: (clientX - rect.left - (ws.scrollX || 0)) / (ws.scale || 1),
+        y: (clientY - rect.top - (ws.scrollY || 0)) / (ws.scale || 1),
+      };
+    }
+    return {
+      x: clientX - rect.left,
+      y: clientY - rect.top,
+    };
+  }
+
+  function workspaceToScreen(x, y) {
+    const canvas = getBlockCanvas();
+    const svg = canvas && canvas.ownerSVGElement;
+    if (canvas && svg && canvas.getScreenCTM) {
+      try {
+        const ctm = canvas.getScreenCTM();
+        if (ctm) {
+          const pt = svg.createSVGPoint();
+          pt.x = x;
+          pt.y = y;
+          const screen = pt.matrixTransform(ctm);
+          return { x: screen.x, y: screen.y };
+        }
+      } catch {
+        
+      }
+    }
+    const blocks = getBlocksEl();
+    const ws = getWorkspace();
+    if (!blocks) return null;
+    const rect = blocks.getBoundingClientRect();
+    if (ws && typeof ws.scale === "number") {
+      return {
+        x: rect.left + x * (ws.scale || 1) + (ws.scrollX || 0),
+        y: rect.top + y * (ws.scale || 1) + (ws.scrollY || 0),
+      };
+    }
+    return { x: rect.left + x, y: rect.top + y };
+  }
+
+  function ensureCursorLayer() {
+    if (cursorLayer && cursorLayer.isConnected) return cursorLayer;
+    cursorLayer = document.createElement("div");
+    cursorLayer.id = "panglive-cursors";
+    document.body.appendChild(cursorLayer);
+    return cursorLayer;
+  }
+
+  function syncRemoteCursorEl(user) {
+    const entry = remoteCursors.get(user);
+    if (!entry) return;
+    const mine = currentCursorTarget();
+    const show =
+      entry.on && entry.target && entry.target === mine && getBlocksEl();
+    if (!show) {
+      entry.el.style.display = "none";
+      return;
+    }
+    const screen = workspaceToScreen(entry.x, entry.y);
+    if (!screen) {
+      entry.el.style.display = "none";
+      return;
+    }
+    const blocks = getBlocksEl();
+    const rect = blocks.getBoundingClientRect();
+    if (
+      screen.x < rect.left - 40 ||
+      screen.x > rect.right + 40 ||
+      screen.y < rect.top - 40 ||
+      screen.y > rect.bottom + 40
+    ) {
+      entry.el.style.display = "none";
+      return;
+    }
+    entry.el.style.display = "";
+    entry.el.style.transform = `translate(${screen.x}px, ${screen.y}px)`;
+  }
+
+  function refreshAllRemoteCursors() {
+    for (const user of remoteCursors.keys()) syncRemoteCursorEl(user);
+  }
+
+  function upsertRemoteCursor(user, payload) {
+    if (!user) return;
+    const on = payload.on !== false;
+    if (!on) {
+      const existing = remoteCursors.get(user);
+      if (existing) {
+        existing.on = false;
+        syncRemoteCursorEl(user);
+      }
+      return;
+    }
+
+    const layer = ensureCursorLayer();
+    let entry = remoteCursors.get(user);
+    if (!entry) {
+      const el = document.createElement("div");
+      el.className = "pl-live-cursor";
+      el.style.display = "none";
+      el.innerHTML = `
+        <img class="pl-live-cursor-icon" src="${CURSOR_ICON}" alt="" draggable="false" />
+        <span class="pl-live-cursor-name"></span>
+      `;
+      const nameEl = el.querySelector(".pl-live-cursor-name");
+      nameEl.textContent = user;
+      nameEl.style.background = hashColor(user);
+      layer.appendChild(el);
+      entry = { el, on: true, target: "", x: 0, y: 0 };
+      remoteCursors.set(user, entry);
+    }
+    entry.on = true;
+    entry.target = String(payload.target || "");
+    entry.x = Number(payload.x) || 0;
+    entry.y = Number(payload.y) || 0;
+    syncRemoteCursorEl(user);
+  }
+
+  function removeRemoteCursor(user) {
+    const entry = remoteCursors.get(user);
+    if (!entry) return;
+    entry.el.remove();
+    remoteCursors.delete(user);
+  }
+
+  function clearRemoteCursors() {
+    for (const entry of remoteCursors.values()) entry.el.remove();
+    remoteCursors.clear();
+    cursorWasOverBlocks = false;
+    lastLocalCursorTarget = "";
+  }
+
+  function pruneRemoteCursors(users) {
+    const alive = new Set(users);
+    for (const user of [...remoteCursors.keys()]) {
+      if (!alive.has(user)) removeRemoteCursor(user);
+    }
+  }
+
+  function sendCursorOff() {
+    if (!transport || !transport.connected) return;
+    transport.broadcast({
+      bc: "cursor",
+      user: transport.username,
+      target: lastLocalCursorTarget || currentCursorTarget(),
+      on: false,
+    });
+  }
+
+  function onLocalPointerMove(e) {
+    if (!transport || !transport.connected) return;
+    const target = currentCursorTarget();
+    if (target !== lastLocalCursorTarget) {
+      if (cursorWasOverBlocks) sendCursorOff();
+      cursorWasOverBlocks = false;
+      lastLocalCursorTarget = target;
+      refreshAllRemoteCursors();
+    }
+
+    const now = Date.now();
+    const wsPoint = pointerToWorkspace(e.clientX, e.clientY);
+
+    if (!wsPoint) {
+      if (cursorWasOverBlocks && now - lastCursorSend >= CURSOR_THROTTLE_MS) {
+        cursorWasOverBlocks = false;
+        lastCursorSend = now;
+        sendCursorOff();
+      }
+      return;
+    }
+
+    if (now - lastCursorSend < CURSOR_THROTTLE_MS) return;
+    cursorWasOverBlocks = true;
+    lastCursorSend = now;
+    transport.broadcast({
+      bc: "cursor",
+      user: transport.username,
+      target,
+      on: true,
+      x: wsPoint.x,
+      y: wsPoint.y,
+    });
+  }
+
+  function onBlocksViewportMaybeChanged() {
+    if (!cursorTracking) return;
+    refreshAllRemoteCursors();
+  }
+
+  function onCursorTargetMaybeChanged() {
+    const target = currentCursorTarget();
+    if (target === lastLocalCursorTarget) return;
+    if (cursorWasOverBlocks) {
+      sendCursorOff();
+      cursorWasOverBlocks = false;
+    }
+    lastLocalCursorTarget = target;
+    refreshAllRemoteCursors();
+  }
+
+  function startCursorTracking() {
+    if (cursorTracking) return;
+    cursorTracking = true;
+    ensureCursorLayer();
+    lastLocalCursorTarget = currentCursorTarget();
+    document.addEventListener("pointermove", onLocalPointerMove, {
+      passive: true,
+    });
+    document.addEventListener("pointerleave", onLocalPointerLeave);
+    window.addEventListener("blur", onLocalPointerLeave);
+    window.addEventListener("resize", onBlocksViewportMaybeChanged);
+    document.addEventListener("wheel", onBlocksViewportMaybeChanged, {
+      passive: true,
+      capture: true,
+    });
+    try {
+      vm.on("targetsUpdate", onCursorTargetMaybeChanged);
+    } catch {
+      
+    }
+  }
+
+  function onLocalPointerLeave() {
+    if (!cursorWasOverBlocks) return;
+    cursorWasOverBlocks = false;
+    lastCursorSend = Date.now();
+    sendCursorOff();
+  }
+
+  function stopCursorTracking() {
+    if (!cursorTracking) return;
+    cursorTracking = false;
+    document.removeEventListener("pointermove", onLocalPointerMove);
+    document.removeEventListener("pointerleave", onLocalPointerLeave);
+    window.removeEventListener("blur", onLocalPointerLeave);
+    window.removeEventListener("resize", onBlocksViewportMaybeChanged);
+    document.removeEventListener("wheel", onBlocksViewportMaybeChanged, true);
+    try {
+      vm.removeListener("targetsUpdate", onCursorTargetMaybeChanged);
+    } catch {
+      
+    }
+    if (cursorWasOverBlocks) sendCursorOff();
+    clearRemoteCursors();
+  }
+
   function bufToBase64(buf) {
     const bytes = new Uint8Array(buf);
     let bin = "";
@@ -121,6 +437,7 @@
   const proxyActions = {};
   const projectChunks = new Map();
   const snapChunks = new Map();
+  const extChunks = new Map();
   let workspaceHookTimer = null;
   const dirtyTargets = new Set();
   let snapTimer = null;
@@ -603,9 +920,11 @@
     if (workspaceHookTimer) return;
     hookWorkspaceListener();
     wrapBlockListener();
+    installExtensionHooks();
     workspaceHookTimer = setInterval(() => {
       hookWorkspaceListener();
       wrapBlockListener();
+      installExtensionHooks();
     }, 400);
   }
 
@@ -646,15 +965,146 @@
     };
   }
 
+  async function resolveExtensionForShare(url) {
+    const u = String(url || "").trim();
+    if (!u) return null;
+    if (/^https?:\/\//i.test(u) || u.startsWith("data:")) {
+      return { kind: "url", url: u };
+    }
+    if (u.startsWith("blob:")) {
+      try {
+        const text = await (await fetch(u)).text();
+        if (!text) return null;
+        return { kind: "source", source: text };
+      } catch (e) {
+        logWarn("blob extension read failed", e);
+        return null;
+      }
+    }
+    return { kind: "url", url: u };
+  }
+
+  function sendExtensionChunks(text, mode) {
+    const body = String(text || "");
+    if (!body) return;
+    const id =
+      Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
+    const parts = Math.ceil(body.length / CHUNK_SIZE);
+    broadcastRaw({ bc: "ext-start", id, parts, mode: mode || "source" });
+    for (let i = 0; i < parts; i++) {
+      broadcastRaw({
+        bc: "ext-part",
+        id,
+        i,
+        data: body.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+      });
+    }
+    broadcastRaw({ bc: "ext-end", id });
+    log("sent chunked extension", mode || "source", parts, "parts");
+  }
+
+  async function shareLoadedExtension(url) {
+    if (!transport || !transport.connected || pauseEventHandling) return;
+    try {
+      const resolved = await resolveExtensionForShare(url);
+      if (!resolved) return;
+      if (resolved.kind === "url") {
+        if (resolved.url.length <= CHUNK_SIZE) {
+          broadcastRaw({ bc: "ext", url: resolved.url });
+        } else {
+          sendExtensionChunks(resolved.url, "url");
+        }
+        log("shared extension url");
+        return;
+      }
+      if (resolved.source.length <= CHUNK_SIZE) {
+        broadcastRaw({ bc: "ext", source: resolved.source });
+      } else {
+        sendExtensionChunks(resolved.source, "source");
+      }
+    } catch (e) {
+      logErr("shareLoadedExtension", e);
+    }
+  }
+
+  async function loadRemoteExtension(payload) {
+    const em = vm.extensionManager;
+    if (!em || typeof em.loadExtensionURL !== "function") return;
+
+    let url = payload && payload.url ? String(payload.url) : "";
+    let createdBlob = null;
+    if (!url && payload && payload.source) {
+      createdBlob = URL.createObjectURL(
+        new Blob([String(payload.source)], {
+          type: "application/javascript",
+        })
+      );
+      url = createdBlob;
+    }
+    if (!url) return;
+
+    pauseEventHandling = true;
+    try {
+      await em.loadExtensionURL(url);
+      log("loaded remote extension");
+    } catch (e) {
+      logErr("remote extension load failed", e);
+    } finally {
+      pauseEventHandling = false;
+    }
+  }
+
+  function handleExtPart(payload) {
+    if (payload.bc === "ext-start") {
+      extChunks.set(payload.id, {
+        parts: payload.parts,
+        chunks: [],
+        mode: payload.mode === "url" ? "url" : "source",
+      });
+    } else if (payload.bc === "ext-part") {
+      const entry = extChunks.get(payload.id);
+      if (entry) entry.chunks[payload.i] = payload.data;
+    } else if (payload.bc === "ext-end") {
+      const entry = extChunks.get(payload.id);
+      extChunks.delete(payload.id);
+      if (!entry) return;
+      const body = entry.chunks.join("");
+      if (!body) return;
+      if (entry.mode === "url") loadRemoteExtension({ url: body });
+      else loadRemoteExtension({ source: body });
+    }
+  }
+
+  function installExtensionHooks() {
+    const em = vm.extensionManager;
+    if (!em || em.__pangliveExtHooked) return false;
+    if (typeof em.loadExtensionURL !== "function") return false;
+    em.__pangliveExtHooked = true;
+    const original = em.loadExtensionURL.bind(em);
+    em.loadExtensionURL = function (url) {
+      const result = original(url);
+      if (!pauseEventHandling) {
+        Promise.resolve(result)
+          .then(() => shareLoadedExtension(url))
+          .catch((e) => logWarn("extension load failed", e));
+      }
+      return result;
+    };
+    log("extensionManager.loadExtensionURL hooked");
+    return true;
+  }
+
   function installHooks() {
     if (hooksInstalled) return;
     hooksInstalled = true;
     log("installHooks");
 
     startWorkspaceHookPolling();
+    installExtensionHooks();
     vm.on("workspaceUpdate", hookWorkspaceListener);
     vm.on("PROJECT_LOADED", () => {
       hookWorkspaceListener();
+      installExtensionHooks();
       silenceOutbound(500);
     });
 
@@ -722,6 +1172,30 @@
     return out;
   }
 
+  function rememberEditingTarget() {
+    const t = vm.editingTarget;
+    if (!t) return null;
+    return { id: t.id, name: targetName(t) };
+  }
+
+  function restoreEditingTarget(saved) {
+    if (!saved) return;
+    let t = saved.id ? runtime.getTargetById(saved.id) : null;
+    if (!t && saved.name) t = nameToTarget(saved.name);
+    if (!t) return;
+    if (vm.editingTarget === t) return;
+    try {
+      if (typeof vm.setEditingTarget === "function") {
+        vm.setEditingTarget(t.id);
+      } else {
+        vm.editingTarget = t;
+        runtime._editingTarget = t;
+      }
+    } catch (e) {
+      logWarn("restoreEditingTarget failed", e);
+    }
+  }
+
   async function loadProjectBytes(buf) {
     pauseEventHandling = true;
     silenceOutbound(2000);
@@ -729,10 +1203,12 @@
     playAfterDrag.length = 0;
     lastApplied.clear();
     clearTimeout(projectSyncTimer);
+    const savedEdit = rememberEditingTarget();
     try {
       await vm.loadProject(buf);
-      vm.emitWorkspaceUpdate();
+      restoreEditingTarget(savedEdit);
       vm.emitTargetsUpdate();
+      vm.emitWorkspaceUpdate();
       hookWorkspaceListener();
     } catch (e) {
       logErr("loadProjectBytes failed", e);
@@ -751,10 +1227,18 @@
         const msg = remoteSpriteInbox.shift();
         if (msg.meta === "sprite.proxy" && proxyActions[msg.data.name]) {
           pauseEventHandling = true;
+          const savedEdit = rememberEditingTarget();
           try {
             await proxyActions[msg.data.name]("linguini", msg.data);
+            restoreEditingTarget(savedEdit);
             vm.emitTargetsUpdate();
-            vm.emitWorkspaceUpdate();
+            if (
+              savedEdit &&
+              vm.editingTarget &&
+              targetName(vm.editingTarget) === savedEdit.name
+            ) {
+              vm.emitWorkspaceUpdate();
+            }
           } finally {
             pauseEventHandling = false;
           }
@@ -818,10 +1302,52 @@
   
 
   let transport;
+  let peerJsLoading = null;
 
-  class RelayTransport {
+  function roomPeerId(room) {
+    return PEER_ID_PREFIX + String(room || "").toUpperCase();
+  }
+
+  function loadPeerJS() {
+    if (typeof window.Peer !== "undefined") return Promise.resolve();
+    if (peerJsLoading) return peerJsLoading;
+    peerJsLoading = (async () => {
+      const allowed = await Scratch.canFetch(PEERJS_CDN);
+      if (!allowed) throw new Error("PeerJS CDN not allowed");
+      await new Promise((resolve, reject) => {
+        const existing = document.querySelector('script[data-panglive-peerjs="1"]');
+        if (existing) {
+          if (typeof window.Peer !== "undefined") {
+            resolve();
+            return;
+          }
+          existing.addEventListener("load", () => resolve());
+          existing.addEventListener("error", () =>
+            reject(new Error("PeerJS failed to load"))
+          );
+          return;
+        }
+        const script = document.createElement("script");
+        script.src = PEERJS_CDN;
+        script.async = true;
+        script.dataset.panglivePeerjs = "1";
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error("PeerJS failed to load"));
+        document.head.appendChild(script);
+      });
+      if (typeof window.Peer === "undefined") {
+        throw new Error("PeerJS not available");
+      }
+    })().catch((e) => {
+      peerJsLoading = null;
+      throw e;
+    });
+    return peerJsLoading;
+  }
+
+  class P2PTransport {
     constructor() {
-      this.ws = null;
+      this.peer = null;
       this.room = "";
       this.username = "";
       this.isHost = false;
@@ -833,6 +1359,10 @@
       this.onChat = null;
       this._projectTimer = null;
       this._projectRequested = false;
+      this._conns = new Map();
+      this._connUsers = new Map();
+      this._hostConn = null;
+      this._gen = 0;
     }
 
     setHandlers({ onPresence, onPayload, onStatus, onChat }) {
@@ -858,187 +1388,354 @@
       this.onPresence?.([...this.onlineUsers].sort());
     }
 
-    broadcast(obj) {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        logWarn("broadcast blocked ws not open", obj.bc);
+    _sendConn(conn, obj) {
+      if (!conn || !conn.open) return false;
+      try {
+        conn.send(obj);
+        return true;
+      } catch (e) {
+        logErr("peer send failed", obj && obj.bc, e);
+        return false;
+      }
+    }
+
+    broadcast(obj, exceptConn) {
+      if (!this.connected) {
+        logWarn("broadcast blocked not connected", obj && obj.bc);
         return;
       }
-      try {
-        this.ws.send(JSON.stringify(obj));
-      } catch (e) {
-        logErr("broadcast failed", obj.bc, e);
+      if (this.isHost) {
+        for (const conn of this._conns.values()) {
+          if (conn === exceptConn) continue;
+          this._sendConn(conn, obj);
+        }
+        return;
+      }
+      this._sendConn(this._hostConn, obj);
+    }
+
+    _wireConn(conn, asHostSide) {
+      const peerId = conn.peer;
+      conn.on("data", (data) => {
+        this._onPeerData(data, conn);
+      });
+      conn.on("close", () => {
+        this._onConnClosed(conn);
+      });
+      conn.on("error", (err) => {
+        logErr("data connection error", peerId, err);
+      });
+
+      const onOpen = () => {
+        if (asHostSide) {
+          this._conns.set(peerId, conn);
+          this.broadcast({ bc: "here", user: this.username }, conn);
+          this._sendConn(conn, { bc: "here", user: this.username });
+          clearTimeout(this._projectTimer);
+          this._projectTimer = setTimeout(() => sendProjectTo(this), 500);
+          log("guest connected", peerId);
+        } else {
+          this._hostConn = conn;
+          this.connected = true;
+          this._projectRequested = true;
+          this._status("connected", "Connected");
+          this.broadcast({ bc: "here", user: this.username });
+          setTimeout(() => this.broadcast({ bc: "need-project" }), 400);
+          installHooks();
+          startCursorTracking();
+          this._emitPresence();
+          log("connected to host", peerId);
+        }
+      };
+
+      if (conn.open) onOpen();
+      else conn.on("open", onOpen);
+    }
+
+    _onConnClosed(conn) {
+      const peerId = conn.peer;
+      const user = this._connUsers.get(peerId);
+      this._conns.delete(peerId);
+      this._connUsers.delete(peerId);
+      if (this._hostConn === conn) this._hostConn = null;
+
+      if (user) {
+        this.onlineUsers.delete(user);
+        removeRemoteCursor(user);
+        this._emitPresence();
+        if (this.isHost) {
+          this.broadcast({ bc: "bye", user });
+        }
+      }
+
+      if (!this.isHost && !this._hostConn) {
+        this.connected = false;
+        stopCursorTracking();
+        this._status("idle", "Disconnected");
+        this._emitPresence();
+      }
+    }
+
+    _markUser(user, conn) {
+      if (!user || user === this.username) return;
+      if (conn) this._connUsers.set(conn.peer, user);
+      if (!this.onlineUsers.has(user)) {
+        this.onlineUsers.add(user);
+        this._emitPresence();
+      }
+    }
+
+    _handlePayload(payload, fromConn) {
+      if (!payload || !payload.bc) return;
+      if (payload.bc === "hello") return;
+
+      if (payload.bc === "msg") {
+        const user = sanitize(payload.user);
+        const text = String(payload.text || "").trim().slice(0, 200);
+        this._markUser(user, fromConn);
+        if (user && text) this.onChat?.({ user, text });
+        return;
+      }
+
+      if (payload.bc === "here") {
+        const user = sanitize(payload.user);
+        this._markUser(user, fromConn);
+        return;
+      }
+
+      if (payload.bc === "bye") {
+        const user = sanitize(payload.user);
+        if (user && user !== this.username) {
+          this.onlineUsers.delete(user);
+          removeRemoteCursor(user);
+          this._emitPresence();
+        }
+        return;
+      }
+
+      if (payload.bc === "cursor") {
+        const user = sanitize(payload.user);
+        if (!user || user === this.username) return;
+        this._markUser(user, fromConn);
+        upsertRemoteCursor(user, payload);
+        return;
+      }
+
+      if (payload.bc === "ext") {
+        loadRemoteExtension(payload);
+        return;
+      }
+
+      if (
+        payload.bc === "ext-start" ||
+        payload.bc === "ext-part" ||
+        payload.bc === "ext-end"
+      ) {
+        handleExtPart(payload);
+        return;
+      }
+
+      if (payload.bc === "need-project" && this.isHost) {
+        clearTimeout(this._projectTimer);
+        this._projectTimer = setTimeout(() => sendProjectTo(this), 300);
+        return;
+      }
+
+      if (
+        payload.bc === "p-start" ||
+        payload.bc === "p-part" ||
+        payload.bc === "p-end"
+      ) {
+        handleProjectPart(payload, (buf) => loadProjectBytes(buf));
+        return;
+      }
+
+      if (payload.bc === "snap") {
+        handleRemoteSnap(payload);
+        return;
+      }
+
+      if (
+        payload.bc === "s-start" ||
+        payload.bc === "s-part" ||
+        payload.bc === "s-end"
+      ) {
+        handleSnapPart(payload);
+        return;
+      }
+
+      if (payload.bc === "sync") {
+        applyRemote(payload);
+      }
+    }
+
+    _onPeerData(data, fromConn) {
+      let payload = data;
+      if (typeof data === "string") {
+        try {
+          payload = JSON.parse(data);
+        } catch {
+          return;
+        }
+      }
+      if (!payload || typeof payload !== "object") return;
+
+      this._handlePayload(payload, fromConn);
+
+      if (this.isHost && fromConn) {
+        this.broadcast(payload, fromConn);
       }
     }
 
     async connect(room, username, isHost) {
       this.disconnect(true);
-      this.room = sanitize(room);
+      const gen = ++this._gen;
+      this.room = sanitize(room).toUpperCase();
       this.username = sanitize(username);
       this.isHost = isHost;
       this.onlineUsers = new Set([this.username]);
+      this._projectRequested = false;
 
-      const url = `${WS_BASE}/${encodeURIComponent(this.room)}/${encodeURIComponent(this.username)}`;
-      log("connect", { room: this.room, username: this.username, isHost, url });
-      this._status("connecting", "Connecting…");
+      log("connect p2p", {
+        room: this.room,
+        username: this.username,
+        isHost,
+      });
+      this._status("connecting", "Loading PeerJS…");
 
-      const allowed = await Scratch.canFetch(url);
-      if (!allowed) {
-        logErr("canFetch denied", url);
-        this._status("error", "Connection not allowed.");
+      try {
+        await loadPeerJS();
+      } catch (e) {
+        logErr("PeerJS load", e);
+        this._status("error", "Could not load PeerJS.");
         return;
       }
+      if (gen !== this._gen) return;
 
-      const ws = new WebSocket(url);
-      this.ws = ws;
+      this._status("connecting", "Connecting…");
+      const hostId = roomPeerId(this.room);
 
-      ws.onopen = () => {
-        this.connected = true;
-        this._projectRequested = false;
-        log("ws open", this.username, this.room, isHost ? "host" : "guest");
-        this._status(
-          "connected",
-          isHost ? `Room ${this.room.toUpperCase()}` : "Connected"
-        );
-        
-        this.broadcast({ bc: "here", user: this.username });
-        if (!isHost) {
-          this._projectRequested = true;
-          setTimeout(() => this.broadcast({ bc: "need-project" }), 400);
-        }
-        installHooks();
-        this._emitPresence();
-      };
+      let peer;
+      try {
+        peer = isHost
+          ? new window.Peer(hostId, { debug: 0 })
+          : new window.Peer({ debug: 0 });
+      } catch (e) {
+        logErr("Peer create", e);
+        this._status("error", "Could not start peer.");
+        return;
+      }
+      this.peer = peer;
 
-      ws.onmessage = (ev) => {
-        let data;
-        try {
-          data = JSON.parse(ev.data);
-        } catch {
-          return;
-        }
+      peer.on("open", (id) => {
+        if (gen !== this._gen || this.peer !== peer) return;
+        log("peer open", id, isHost ? "host" : "guest");
 
-        if (data.type === "system") {
-          const user = sanitize(data.username);
-          if (data.action === "join") {
-            this.onlineUsers.add(user);
-            this._emitPresence();
-            
-            if (user !== this.username) {
-              this.broadcast({ bc: "here", user: this.username });
-            }
-            if (this.isHost && user !== this.username) {
-              clearTimeout(this._projectTimer);
-              this._projectTimer = setTimeout(() => sendProjectTo(this), 500);
-            }
-          } else if (data.action === "leave") {
-            this.onlineUsers.delete(user);
-            this._emitPresence();
-          }
-          return;
-        }
-
-        if (data.type !== "chat" || data.username === this.username) return;
-
-        
-        const chatUser = sanitize(data.username);
-        if (chatUser && !this.onlineUsers.has(chatUser)) {
-          this.onlineUsers.add(chatUser);
+        if (isHost) {
+          this.connected = true;
+          this._status("connected", `Room ${this.room}`);
+          installHooks();
+          startCursorTracking();
           this._emitPresence();
+          return;
         }
 
-        let payload;
+        this._status("connecting", "Joining host…");
+        const conn = peer.connect(hostId, {
+          reliable: true,
+          serialization: "json",
+        });
+        this._wireConn(conn, false);
+      });
+
+      peer.on("connection", (conn) => {
+        if (gen !== this._gen || this.peer !== peer || !this.isHost) return;
+        this._wireConn(conn, true);
+      });
+
+      peer.on("error", (err) => {
+        if (gen !== this._gen || this.peer !== peer) return;
+        const type = err && err.type;
+        logErr("peer error", type || err);
+        if (type === "unavailable-id") {
+          this._status("error", "Room code already in use.");
+          this.disconnect(true);
+          return;
+        }
+        if (type === "peer-unavailable") {
+          this._status("error", "Host not found. Is the room open?");
+          this.disconnect(true);
+          return;
+        }
+        if (type === "network" || type === "server-error") {
+          this._status("error", "PeerJS network error.");
+          return;
+        }
+        if (type === "disconnected") {
+          this._status("error", "Disconnected from PeerJS.");
+          return;
+        }
+        this._status("error", "Peer connection error.");
+      });
+
+      peer.on("disconnected", () => {
+        if (gen !== this._gen || this.peer !== peer) return;
         try {
-          payload = JSON.parse(data.message);
+          peer.reconnect();
         } catch {
-          return;
+          
         }
-        if (!payload.bc) return;
+      });
 
-        if (payload.bc === "hello") return;
-
-        if (payload.bc === "msg") {
-          const user = sanitize(payload.user || data.username);
-          const text = String(payload.text || "").trim().slice(0, 200);
-          if (user && text) this.onChat?.({ user, text });
-          return;
-        }
-
-        if (payload.bc === "here") {
-          const user = sanitize(payload.user || data.username);
-          if (user && user !== this.username) {
-            this.onlineUsers.add(user);
-            this._emitPresence();
-          }
-          return;
-        }
-
-        if (payload.bc === "need-project" && this.isHost) {
-          clearTimeout(this._projectTimer);
-          this._projectTimer = setTimeout(() => sendProjectTo(this), 300);
-          return;
-        }
-
-        if (
-          payload.bc === "p-start" ||
-          payload.bc === "p-part" ||
-          payload.bc === "p-end"
-        ) {
-          handleProjectPart(payload, (buf) => loadProjectBytes(buf));
-          return;
-        }
-
-        if (payload.bc === "snap") {
-          handleRemoteSnap(payload);
-          return;
-        }
-
-        if (
-          payload.bc === "s-start" ||
-          payload.bc === "s-part" ||
-          payload.bc === "s-end"
-        ) {
-          handleSnapPart(payload);
-          return;
-        }
-
-        if (payload.bc === "sync") {
-          applyRemote(payload);
-        }
-      };
-
-      ws.onerror = () => {
-        logErr("ws error");
-        this._status("error", "WebSocket error.");
-      };
-
-      ws.onclose = () => {
+      peer.on("close", () => {
+        if (gen !== this._gen || this.peer !== peer) return;
         this.connected = false;
-        log("ws close", this.username);
-        if (this.ws === ws) {
-          this._status("idle", "Disconnected");
-          this._emitPresence();
-        }
-      };
+        stopCursorTracking();
+        this._status("idle", "Disconnected");
+        this._emitPresence();
+      });
     }
 
     disconnect(silent) {
-      if (this.ws) {
+      this._gen += 1;
+      stopCursorTracking();
+      clearTimeout(this._projectTimer);
+      this._projectTimer = null;
+
+      for (const conn of this._conns.values()) {
         try {
-          this.ws.onclose = null;
-          this.ws.close();
+          conn.close();
         } catch {
           
         }
       }
-      this.ws = null;
+      this._conns.clear();
+      this._connUsers.clear();
+
+      if (this._hostConn) {
+        try {
+          this._hostConn.close();
+        } catch {
+          
+        }
+      }
+      this._hostConn = null;
+
+      if (this.peer) {
+        try {
+          this.peer.destroy();
+        } catch {
+          
+        }
+      }
+      this.peer = null;
       this.connected = false;
+      this.onlineUsers = new Set();
       if (!silent) this._status("idle", "Disconnected");
     }
   }
 
-  
-
-  transport = new RelayTransport();
+  transport = new P2PTransport();
   sendLocalFn = (payload) => transport.broadcast(payload);
 
   function injectStyles() {
@@ -1103,14 +1800,30 @@
       #panglive-window.connected .pl-online { display: flex; }
       #panglive-window.connected .pl-form { display: none; }
       .pl-online-label { font-size: 12px; font-weight: 700; color: #111; }
-      .pl-avatars { display: flex; }
+      .pl-avatars { display: flex; position: relative; }
       .pl-avatar {
+        position: relative;
         width: 22px; height: 22px; border-radius: 50%;
         margin-left: -4px; display: flex; align-items: center;
         justify-content: center; color: #fff; font-size: 10px;
         font-weight: 700; border: 1px solid #fff;
       }
       .pl-avatar:first-child { margin-left: 0; }
+      .pl-avatar::after {
+        content: attr(data-name);
+        position: absolute; left: 50%; bottom: calc(100% + 6px);
+        transform: translateX(-50%);
+        padding: 2px 6px; border-radius: 4px;
+        background: #222; color: #fff;
+        font-size: 11px; font-weight: 600; line-height: 1.3;
+        white-space: nowrap; pointer-events: none;
+        opacity: 0; visibility: hidden;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+        z-index: 2;
+      }
+      .pl-avatar:hover::after {
+        opacity: 1; visibility: visible;
+      }
       .pl-leave {
         margin-left: auto; border: none; background: transparent;
         color: #b00020; font-size: 12px; font-weight: 600; cursor: pointer;
@@ -1137,6 +1850,29 @@
       }
       .pl-chat-send .pl-btn {
         width: auto; padding: 8px 10px; flex-shrink: 0;
+      }
+      #panglive-cursors {
+        position: fixed; inset: 0; z-index: 10040;
+        pointer-events: none; overflow: hidden;
+      }
+      .pl-live-cursor {
+        position: absolute; left: 0; top: 0;
+        display: flex; flex-direction: column; align-items: flex-start;
+        gap: 2px; will-change: transform;
+        transition: transform 0.05s linear;
+      }
+      .pl-live-cursor-icon {
+        width: 28px; height: 28px; display: block;
+        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.35));
+      }
+      .pl-live-cursor-name {
+        max-width: 96px; padding: 1px 6px;
+        border-radius: 4px; color: #fff;
+        font-size: 11px; font-weight: 700; line-height: 1.4;
+        font-family: system-ui, sans-serif;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+        transform: translateX(-35%);
       }
     `;
     document.head.appendChild(style);
@@ -1237,14 +1973,6 @@
 
     usernameInput.value = randomUsername();
     makeDraggable(titlebar, win);
-
-    function escapeHtml(s) {
-      return String(s)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
 
     function renderChat() {
       if (chatMessages.length === 0) {
@@ -1358,11 +2086,12 @@
         users.slice(0, 8).forEach((name) => {
           const el = document.createElement("div");
           el.className = "pl-avatar";
-          el.title = name;
+          el.dataset.name = name;
           el.style.background = hashColor(name);
           el.textContent = name.slice(0, 1);
           avatars.appendChild(el);
         });
+        pruneRemoteCursors(users);
       },
       onChat: ({ user, text }) => {
         pushChat(user, text);
@@ -1378,6 +2107,7 @@
           win.classList.remove("connected");
           roomBlock.classList.add("hidden");
           clearChat();
+          clearRemoteCursors();
         }
       },
     });
