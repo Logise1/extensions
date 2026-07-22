@@ -531,13 +531,33 @@
     return !!(ws && typeof ws.isDragging === "function" && ws.isDragging());
   }
 
+  function serializeComments(comments) {
+    const out = {};
+    if (!comments) return out;
+    const ids = Object.keys(comments);
+    for (let i = 0; i < ids.length; i++) {
+      const c = comments[ids[i]];
+      if (!c) continue;
+      out[ids[i]] = {
+        blockId: c.blockId || null,
+        text: typeof c.text === "string" ? c.text : "",
+        x: typeof c.x === "number" ? c.x : 0,
+        y: typeof c.y === "number" ? c.y : 0,
+        width: typeof c.width === "number" ? c.width : 100,
+        height: typeof c.height === "number" ? c.height : 100,
+        minimized: !!c.minimized,
+      };
+    }
+    return out;
+  }
+
   function serializeTarget(target) {
     return {
       blocks: cloneJson(target.blocks._blocks) || {},
       scripts: Array.isArray(target.blocks._scripts)
         ? target.blocks._scripts.slice()
         : [],
-      comments: cloneJson(target.comments) || {},
+      comments: serializeComments(target.comments),
       variables: cloneJson(target.variables) || {},
     };
   }
@@ -604,6 +624,106 @@
     }
   }
 
+  function xmlEscapeText(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+  }
+
+  function clearTargetComments(target) {
+    if (!target || !target.comments) return;
+    const ids = Object.keys(target.comments);
+    for (let i = 0; i < ids.length; i++) {
+      const c = target.comments[ids[i]];
+      if (c && c.blockId && target.blocks && target.blocks.getBlock) {
+        const block = target.blocks.getBlock(c.blockId);
+        if (block && block.comment === ids[i]) delete block.comment;
+      }
+      delete target.comments[ids[i]];
+    }
+  }
+
+  function applyComments(target, comments) {
+    if (!target) return;
+    clearTargetComments(target);
+    if (!comments || typeof comments !== "object") return;
+
+    const ids = Object.keys(comments);
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      const c = comments[id];
+      if (!c) continue;
+      const text =
+        String(c.text || "") +
+        (typeof c.extraText === "string" ? c.extraText : "");
+      const blockId = c.blockId || null;
+      const x = typeof c.x === "number" ? c.x : 0;
+      const y = typeof c.y === "number" ? c.y : 0;
+      const width = typeof c.width === "number" ? c.width : 100;
+      const height = typeof c.height === "number" ? c.height : 100;
+      const minimized = !!c.minimized;
+
+      if (typeof target.createComment === "function") {
+        try {
+          target.createComment(
+            id,
+            blockId,
+            text,
+            x,
+            y,
+            width,
+            height,
+            minimized
+          );
+          continue;
+        } catch (e) {
+          logWarn("createComment failed", id, e);
+        }
+      }
+
+      // fallback: plain object with toXML so workspaceUpdate can render it
+      const comment = {
+        id: id,
+        text: text,
+        x: x,
+        y: y,
+        width: width,
+        height: height,
+        minimized: minimized,
+        blockId: blockId,
+        toXML: function () {
+          return (
+            '<comment id="' +
+            this.id +
+            '" x="' +
+            this.x +
+            '" y="' +
+            this.y +
+            '" w="' +
+            this.width +
+            '" h="' +
+            this.height +
+            '" pinned="' +
+            (this.blockId !== null) +
+            '" minimized="' +
+            this.minimized +
+            '">' +
+            xmlEscapeText(this.text) +
+            "</comment>"
+          );
+        },
+      };
+      target.comments[id] = comment;
+      if (blockId && target.blocks && target.blocks.getBlock) {
+        const block = target.blocks.getBlock(blockId);
+        if (block) block.comment = id;
+      }
+    }
+  }
+
   function replaceTargetFromSnap(payload) {
     const target = nameToTarget(payload.target);
     if (!target || !target.blocks) {
@@ -662,9 +782,7 @@
       }
 
       mergeVariables(target, payload.variables);
-      if (payload.comments && typeof payload.comments === "object") {
-        target.comments = cloneJson(payload.comments);
-      }
+      applyComments(target, payload.comments);
       if (payload.stageVariables) {
         mergeVariables(runtime.getTargetForStage(), payload.stageVariables);
       }
@@ -674,7 +792,14 @@
       if (targetName(vm.editingTarget) === payload.target) {
         vm.emitWorkspaceUpdate();
       }
-      log("applied snap", payload.target, "blocks:", blockList.length);
+      log(
+        "applied snap",
+        payload.target,
+        "blocks:",
+        blockList.length,
+        "comments:",
+        Object.keys(target.comments || {}).length
+      );
       return true;
     } catch (e) {
       logErr("replaceTargetFromSnap failed", payload.target, e);
@@ -1101,12 +1226,15 @@
       return;
     }
     
+    const isComment = type && type.indexOf("comment") === 0;
     scheduleSnapshotFlush(
       type === "create" || type === "endDrag"
         ? 320
-        : type === "change" || (type && type.indexOf("comment") === 0)
-          ? 200
-          : 280
+        : isComment
+          ? 180
+          : type === "change"
+            ? 200
+            : 280
     );
   }
 
@@ -1619,6 +1747,15 @@
       const finish = (ok) => {
         pauseEventHandling = wasPaused;
         refreshSpritePosFinger();
+        hookWorkspaceListener();
+        try {
+          if (typeof vm.emitTargetsUpdate === "function") vm.emitTargetsUpdate();
+          if (typeof vm.emitWorkspaceUpdate === "function") {
+            vm.emitWorkspaceUpdate();
+          }
+        } catch (e) {
+          logWarn("post-load workspace refresh failed", e);
+        }
         if (transport && transport.connected) startSpritePosPolling();
         if (ok && !wasPaused && transport && transport.connected) {
           setTimeout(() => {
@@ -1753,14 +1890,24 @@
 
     let workspaceUpdateQueued = false;
     const origEmitWorkspaceUpdate = vm.emitWorkspaceUpdate.bind(vm);
+    function flushWorkspaceUpdate() {
+      if (pauseEventHandling) {
+        workspaceUpdateQueued = true;
+        setTimeout(flushWorkspaceUpdate, 50);
+        return;
+      }
+      workspaceUpdateQueued = false;
+      try {
+        origEmitWorkspaceUpdate();
+      } catch (e) {
+        logWarn("emitWorkspaceUpdate failed", e);
+      }
+    }
     vm.emitWorkspaceUpdate = function () {
       if (pauseEventHandling) {
         if (!workspaceUpdateQueued) {
           workspaceUpdateQueued = true;
-          requestAnimationFrame(() => {
-            workspaceUpdateQueued = false;
-            if (!pauseEventHandling) origEmitWorkspaceUpdate();
-          });
+          setTimeout(flushWorkspaceUpdate, 50);
         }
         return;
       }
@@ -1814,15 +1961,21 @@
         await vm.loadProject(buf);
       });
       restoreEditingTarget(savedEdit);
-      vm.emitTargetsUpdate();
-      vm.emitWorkspaceUpdate();
-      hookWorkspaceListener();
       refreshSpritePosFinger();
     } catch (e) {
       logErr("loadProjectBytes failed", e);
     } finally {
       await sleep(120);
       pauseEventHandling = false;
+      hookWorkspaceListener();
+      try {
+        if (typeof vm.emitTargetsUpdate === "function") vm.emitTargetsUpdate();
+        if (typeof vm.emitWorkspaceUpdate === "function") {
+          vm.emitWorkspaceUpdate();
+        }
+      } catch (e) {
+        logWarn("post-remote-load workspace refresh failed", e);
+      }
       silenceOutbound(1500);
     }
   }
