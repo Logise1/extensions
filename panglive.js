@@ -1351,30 +1351,33 @@
 
   async function withExtensionLoadPermissions(run) {
     const em = vm.extensionManager;
-    const sm = em && em.securityManager;
-    if (!sm) return run();
+    if (!em) return run();
+    if (!em.securityManager) em.securityManager = {};
+    const sm = em.securityManager;
     const saved = {};
+    const stub = (name, fn) => {
+      saved[name] = sm[name];
+      sm[name] = fn;
+    };
     try {
-      if (typeof sm.getSandboxMode === "function") {
-        saved.getSandboxMode = sm.getSandboxMode;
-        sm.getSandboxMode = function () {
-          return "unsandboxed";
-        };
-      }
-      if (typeof sm.canLoadExtensionFromProject === "function") {
-        saved.canLoadExtensionFromProject = sm.canLoadExtensionFromProject;
-        sm.canLoadExtensionFromProject = function () {
+      stub("getSandboxMode", function () {
+        return "unsandboxed";
+      });
+      stub("canLoadExtensionFromProject", function () {
+        return Promise.resolve(true);
+      });
+      if (typeof sm.canFetch === "function") {
+        stub("canFetch", function () {
           return Promise.resolve(true);
-        };
+        });
       }
       return await run();
     } finally {
       for (const key of Object.keys(saved)) {
         try {
-          sm[key] = saved[key];
-        } catch {
-          
-        }
+          if (typeof saved[key] === "undefined") delete sm[key];
+          else sm[key] = saved[key];
+        } catch (e) {}
       }
     }
   }
@@ -1563,6 +1566,11 @@
   async function sharePendingOrSavedProject() {
     if (!transport || !transport.connected) return;
     clearOutboundSilence();
+    try {
+      await shareLoadedCustomExtensions();
+    } catch (e) {
+      logWarn("share extensions before project", e);
+    }
     const raw = await resolveCapturedProject(pendingImportBuffer);
     pendingImportBuffer = null;
     if (raw && raw.byteLength > 0) {
@@ -1618,7 +1626,7 @@
               logErr("post-import project share failed", e);
               scheduleProjectSync(800, true);
             });
-          }, 900);
+          }, 1600);
         } else {
           if (!wasPaused) pendingImportBuffer = null;
           silenceOutbound(800);
@@ -1802,7 +1810,9 @@
     clearTimeout(projectSyncTimer);
     const savedEdit = rememberEditingTarget();
     try {
-      await vm.loadProject(buf);
+      await withExtensionLoadPermissions(async () => {
+        await vm.loadProject(buf);
+      });
       restoreEditingTarget(savedEdit);
       vm.emitTargetsUpdate();
       vm.emitWorkspaceUpdate();
@@ -2679,14 +2689,17 @@
   bottom: 12px;
   z-index: 10050;
   width: 220px;
-  background: #ffffff;
+  background: #fff !important;
   border: 1px solid #888;
   font: 12px Arial, sans-serif;
-  color: #111111;
+  color: #111 !important;
+}
+#panglive-window * {
+  color: inherit;
 }
 #panglive-window .pl-bar {
-  background: #4C97FF;
-  color: #ffffff;
+  background: #4C97FF !important;
+  color: #fff !important;
   padding: 6px 8px;
   cursor: move;
   user-select: none;
@@ -2694,72 +2707,76 @@
 #panglive-window .pl-bar button {
   float: right;
   border: 1px solid #ccc;
-  background: #ffffff;
-  color: #111111;
+  background: #fff !important;
+  color: #111 !important;
   font-size: 11px;
   padding: 0 5px;
   cursor: pointer;
 }
 #panglive-window .pl-body {
   padding: 8px;
-  background: #ffffff;
-  color: #111111;
+  background: #fff !important;
+  color: #111 !important;
 }
 #panglive-window label {
   display: block;
   margin: 4px 0 2px;
-  color: #111111;
+  color: #111 !important;
 }
-#panglive-window input[type=text] {
+#panglive-window input,
+#panglive-window textarea {
   width: 100%;
   box-sizing: border-box;
   padding: 4px;
   border: 1px solid #999;
-  background: #ffffff;
-  color: #111111;
+  background: #fff !important;
+  color: #111 !important;
+  caret-color: #111 !important;
   font: 12px Arial, sans-serif;
+  -webkit-text-fill-color: #111 !important;
 }
-#panglive-window input[type=text]::placeholder {
-  color: #777777;
+#panglive-window input::placeholder {
+  color: #777 !important;
+  -webkit-text-fill-color: #777 !important;
+  opacity: 1;
 }
 #panglive-window button.pl-btn {
   width: 100%;
   margin-top: 5px;
   padding: 5px;
   border: 1px solid #777;
-  background: #eeeeee;
-  color: #111111;
+  background: #eee !important;
+  color: #111 !important;
   font: 12px Arial, sans-serif;
   cursor: pointer;
 }
 #panglive-window button.pl-btn:hover {
-  background: #dddddd;
-  color: #111111;
+  background: #ddd !important;
 }
 #panglive-window .pl-status {
   margin-top: 5px;
-  color: #444444;
+  color: #444 !important;
   min-height: 14px;
 }
 #panglive-window .pl-status.err {
-  color: #cc0000;
+  color: #c00 !important;
 }
 #panglive-window .pl-who {
   margin-bottom: 6px;
   word-break: break-word;
-  color: #111111;
+  color: #111 !important;
 }
 #panglive-window .pl-room {
   font: bold 18px Consolas, monospace;
   letter-spacing: 2px;
   text-align: center;
   margin: 4px 0;
-  color: #111111;
+  color: #111 !important;
 }
 #panglive-window .pl-leave {
   border: none;
-  background: transparent;
-  color: #cc0000;
+  background: transparent !important;
+  color: #c00 !important;
   font-size: 12px;
   cursor: pointer;
   padding: 0;
@@ -2771,13 +2788,7 @@
   padding-top: 6px;
 }
 #panglive-window #pl-log {
-  width: 100%;
   height: 110px;
-  box-sizing: border-box;
-  border: 1px solid #999;
-  background: #ffffff;
-  color: #111111;
-  padding: 4px;
   font: 11px Consolas, monospace;
   resize: vertical;
 }
@@ -2796,7 +2807,7 @@
 #panglive-window #pl-typing {
   display: block;
   height: 14px;
-  color: #555555;
+  color: #555 !important;
   font-size: 11px;
 }
 #panglive-cursors {
@@ -2822,7 +2833,7 @@
   display: inline-block;
   margin-top: 1px;
   padding: 1px 4px;
-  color: #ffffff;
+  color: #fff !important;
   font: 10px Arial, sans-serif;
   max-width: 90px;
   overflow: hidden;
