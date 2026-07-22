@@ -1463,7 +1463,7 @@
     for (const url of urls) {
       if (seen.has(url)) continue;
       seen.add(url);
-      // Builtin extension ids are not URLs — skip.
+      // Builtin extension ids are not URLs > skip.
       if (
         !/^https?:\/\//i.test(url) &&
         !url.startsWith("data:") &&
@@ -1685,7 +1685,7 @@
     vm.on("PROJECT_LOADED", () => {
       hookWorkspaceListener();
       installExtensionHooks();
-      // Don't silence here if a forced project sync is pending — that used to
+      // Don't silence here if a forced project sync is pending > that used to
       // cancel sharing after File > Load.
       if (!projectSyncBusy && !projectSyncTimer) {
         silenceOutbound(800);
