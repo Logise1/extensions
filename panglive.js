@@ -467,6 +467,7 @@
   
 
   let pauseEventHandling = false;
+  let ignoreWorkspaceEvents = false;
   let hooksInstalled = false;
   let sendLocalFn = null;
   const proxyActions = {};
@@ -755,18 +756,23 @@
       return true;
     }
 
-    
     silenceOutbound(1200);
     pauseEventHandling = true;
+    ignoreWorkspaceEvents = true;
+    const shouldRefreshUi =
+      targetName(vm.editingTarget) === payload.target;
     try {
       const blocks = target.blocks;
-      const ids = Object.keys(blocks._blocks);
-      for (let i = 0; i < ids.length; i++) {
-        try {
-          blocks.deleteBlock(ids[i]);
-        } catch {
-          
+      if (typeof blocks.deleteAllBlocks === "function") {
+        blocks.deleteAllBlocks();
+      } else {
+        const ids = Object.keys(blocks._blocks);
+        for (let i = 0; i < ids.length; i++) {
+          try {
+            blocks.deleteBlock(ids[i]);
+          } catch (e) {}
         }
+        if (Array.isArray(blocks._scripts)) blocks._scripts.length = 0;
       }
 
       const incoming = payload.blocks || {};
@@ -789,9 +795,6 @@
 
       lastApplied.set(payload.target, stamp);
       lastSentHash.set(payload.target, incomingKey);
-      if (targetName(vm.editingTarget) === payload.target) {
-        vm.emitWorkspaceUpdate();
-      }
       log(
         "applied snap",
         payload.target,
@@ -807,10 +810,13 @@
     } finally {
       pauseEventHandling = false;
       silenceOutbound(1200);
+      if (shouldRefreshUi) refreshBlocksUi();
       setTimeout(() => {
+        ignoreWorkspaceEvents = false;
         dirtyTargets.delete(payload.target);
         silenceOutbound(400);
-      }, 50);
+        if (shouldRefreshUi) refreshBlocksUi();
+      }, 0);
     }
   }
 
@@ -1183,8 +1189,28 @@
     }
   }
 
+  function refreshBlocksUi() {
+    try {
+      if (typeof vm.refreshWorkspace === "function") {
+        vm.refreshWorkspace();
+        return;
+      }
+      if (typeof vm.emitWorkspaceUpdate === "function") {
+        vm.emitWorkspaceUpdate();
+      }
+      if (vm.editingTarget && vm.runtime && typeof vm.runtime.setEditingTarget === "function") {
+        vm.runtime.setEditingTarget(vm.editingTarget);
+      }
+      if (typeof vm.emitTargetsUpdate === "function") {
+        vm.emitTargetsUpdate(false);
+      }
+    } catch (e) {
+      logWarn("refreshBlocksUi failed", e);
+    }
+  }
+
   function noteLocalEdit(e) {
-    if (!canSendSync()) return;
+    if (ignoreWorkspaceEvents || !canSendSync()) return;
     if (e && e.isPangLive) return;
 
     const name = targetName(vm.editingTarget);
@@ -1746,16 +1772,14 @@
 
       const finish = (ok) => {
         pauseEventHandling = wasPaused;
+        ignoreWorkspaceEvents = false;
         refreshSpritePosFinger();
         hookWorkspaceListener();
-        try {
-          if (typeof vm.emitTargetsUpdate === "function") vm.emitTargetsUpdate();
-          if (typeof vm.emitWorkspaceUpdate === "function") {
-            vm.emitWorkspaceUpdate();
-          }
-        } catch (e) {
-          logWarn("post-load workspace refresh failed", e);
-        }
+        silenceOutbound(ok ? 1500 : 800);
+        // scratch may have tried to paint while we were paused; force it now
+        refreshBlocksUi();
+        setTimeout(refreshBlocksUi, 0);
+        setTimeout(refreshBlocksUi, 100);
         if (transport && transport.connected) startSpritePosPolling();
         if (ok && !wasPaused && transport && transport.connected) {
           setTimeout(() => {
@@ -1764,12 +1788,12 @@
               scheduleProjectSync(800, true);
             });
           }, 1600);
-        } else {
-          if (!wasPaused) pendingImportBuffer = null;
-          silenceOutbound(800);
+        } else if (!wasPaused) {
+          pendingImportBuffer = null;
         }
       };
 
+      ignoreWorkspaceEvents = true;
       let result;
       try {
         result = original(input);
@@ -1888,31 +1912,6 @@
       }
     }
 
-    let workspaceUpdateQueued = false;
-    const origEmitWorkspaceUpdate = vm.emitWorkspaceUpdate.bind(vm);
-    function flushWorkspaceUpdate() {
-      if (pauseEventHandling) {
-        workspaceUpdateQueued = true;
-        setTimeout(flushWorkspaceUpdate, 50);
-        return;
-      }
-      workspaceUpdateQueued = false;
-      try {
-        origEmitWorkspaceUpdate();
-      } catch (e) {
-        logWarn("emitWorkspaceUpdate failed", e);
-      }
-    }
-    vm.emitWorkspaceUpdate = function () {
-      if (pauseEventHandling) {
-        if (!workspaceUpdateQueued) {
-          workspaceUpdateQueued = true;
-          setTimeout(flushWorkspaceUpdate, 50);
-        }
-        return;
-      }
-      origEmitWorkspaceUpdate();
-    };
   }
 
   async function saveProjectBytes() {
@@ -1950,6 +1949,7 @@
 
   async function loadProjectBytes(buf) {
     pauseEventHandling = true;
+    ignoreWorkspaceEvents = true;
     silenceOutbound(4000);
     dirtyTargets.clear();
     playAfterDrag.length = 0;
@@ -1965,17 +1965,13 @@
     } catch (e) {
       logErr("loadProjectBytes failed", e);
     } finally {
-      await sleep(120);
+      await sleep(50);
       pauseEventHandling = false;
+      ignoreWorkspaceEvents = false;
       hookWorkspaceListener();
-      try {
-        if (typeof vm.emitTargetsUpdate === "function") vm.emitTargetsUpdate();
-        if (typeof vm.emitWorkspaceUpdate === "function") {
-          vm.emitWorkspaceUpdate();
-        }
-      } catch (e) {
-        logWarn("post-remote-load workspace refresh failed", e);
-      }
+      refreshBlocksUi();
+      setTimeout(refreshBlocksUi, 0);
+      setTimeout(refreshBlocksUi, 100);
       silenceOutbound(1500);
     }
   }
@@ -1988,20 +1984,22 @@
         const msg = remoteSpriteInbox.shift();
         if (msg.meta === "sprite.proxy" && proxyActions[msg.data.name]) {
           pauseEventHandling = true;
+          ignoreWorkspaceEvents = true;
           const savedEdit = rememberEditingTarget();
           try {
             await proxyActions[msg.data.name]("linguini", msg.data);
             restoreEditingTarget(savedEdit);
             vm.emitTargetsUpdate();
+          } finally {
+            pauseEventHandling = false;
+            ignoreWorkspaceEvents = false;
             if (
               savedEdit &&
               vm.editingTarget &&
               targetName(vm.editingTarget) === savedEdit.name
             ) {
-              vm.emitWorkspaceUpdate();
+              refreshBlocksUi();
             }
-          } finally {
-            pauseEventHandling = false;
           }
         }
       }
