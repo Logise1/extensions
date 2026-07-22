@@ -19,6 +19,7 @@
   const PROJECT_CHUNK_YIELD_EVERY = 1;
   const CURSOR_ICON =
     "https://logise1.github.io/static/790c78d39fd853ae72167411aa11d727.svg";
+  const ASSET_BASE = "https://logise1.github.io/extensions/assets/";
   const CURSOR_THROTTLE_MS = 50;
   const TYPING_IDLE_MS = 1500;
   const CHAT_HISTORY = 50;
@@ -27,6 +28,37 @@
   const SPRITE_STATE_FLUSH_MS = 100;
   const vm = Scratch.vm;
   const runtime = vm.runtime;
+
+  const sfxCache = Object.create(null);
+
+  function playSfx(name) {
+    try {
+      let base = sfxCache[name];
+      if (!base) {
+        base = new Audio(`${ASSET_BASE}${name}.ogg`);
+        base.preload = "auto";
+        sfxCache[name] = base;
+      }
+      const audio = base.cloneNode();
+      const p = audio.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    } catch {
+      
+    }
+  }
+
+  function warmSfx() {
+    for (const name of ["join", "leave", "msg"]) {
+      if (sfxCache[name]) continue;
+      try {
+        const audio = new Audio(`${ASSET_BASE}${name}.ogg`);
+        audio.preload = "auto";
+        sfxCache[name] = audio;
+      } catch {
+        
+      }
+    }
+  }
 
   const sanitize = (s) =>
     String(s || "")
@@ -2908,9 +2940,12 @@
     const chatMessages = [];
     const typingUsers = new Map();
     let typingTimer = null;
+    let knownUsers = new Set();
+    let presenceSeeded = false;
 
     usernameInput.value = randomUsername();
     makeDraggable(titlebar, win);
+    warmSfx();
 
     function renderTyping() {
       const names = [...typingUsers.keys()];
@@ -2971,6 +3006,7 @@
       chatMessages.push({ user, text });
       while (chatMessages.length > CHAT_HISTORY) chatMessages.shift();
       renderChat();
+      playSfx("msg");
     }
 
     function clearChat() {
@@ -3010,6 +3046,7 @@
     });
 
     win.querySelector("#pl-create").addEventListener("click", () => {
+      warmSfx();
       const code = randomRoomCode();
       roomCodeEl.textContent = code;
       statusEl.className = "pl-status";
@@ -3049,6 +3086,7 @@
         statusEl.className = "pl-status error";
         return;
       }
+      warmSfx();
       statusEl.className = "pl-status";
       statusEl.textContent = "Joining…";
       transport.connect(code, getUsername(), false);
@@ -3095,6 +3133,23 @@
         }
         renderTyping();
         pruneRemoteCursors(users);
+
+        if (!presenceSeeded) {
+          knownUsers = new Set(users);
+          presenceSeeded = true;
+          return;
+        }
+        for (const name of users) {
+          if (!knownUsers.has(name) && name !== transport.username) {
+            playSfx("join");
+          }
+        }
+        for (const name of knownUsers) {
+          if (!users.includes(name) && name !== transport.username) {
+            playSfx("leave");
+          }
+        }
+        knownUsers = new Set(users);
       },
       onChat: ({ user, text }) => {
         pushChat(user, text);
@@ -3109,11 +3164,15 @@
           win.classList.add("connected");
           roomCodeEl.textContent = transport.room.toUpperCase();
           roomBlock.classList.remove("hidden");
+          presenceSeeded = false;
+          knownUsers = new Set();
         } else if (state === "idle" || state === "error") {
           win.classList.remove("connected");
           roomBlock.classList.add("hidden");
           clearChat();
           clearRemoteCursors();
+          presenceSeeded = false;
+          knownUsers = new Set();
         }
       },
     });
