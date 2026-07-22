@@ -16,9 +16,15 @@
   const PEER_ID_PREFIX = "panglive-";
   const STAGE_NAME = "__PangLiveStage__";
   const CHUNK_SIZE = 12000;
+  const PROJECT_CHUNK_YIELD_EVERY = 1;
   const CURSOR_ICON =
     "https://logise1.github.io/static/790c78d39fd853ae72167411aa11d727.svg";
   const CURSOR_THROTTLE_MS = 50;
+  const TYPING_IDLE_MS = 1500;
+  const CHAT_HISTORY = 50;
+  const KEEP_ALIVE_MS = 4000;
+  const GHOST_TIMEOUT_MS = 14000;
+  const SPRITE_STATE_FLUSH_MS = 100;
   const vm = Scratch.vm;
   const runtime = vm.runtime;
 
@@ -420,6 +426,16 @@
     return btoa(bin);
   }
 
+  async function bufToBase64Async(buf) {
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      if (i > 0 && i % 0x100000 === 0) await sleep(0);
+    }
+    return btoa(bin);
+  }
+
   function base64ToBuf(b64) {
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
@@ -438,11 +454,16 @@
   const projectChunks = new Map();
   const snapChunks = new Map();
   const extChunks = new Map();
+  const spriteChunks = new Map();
   let workspaceHookTimer = null;
   const dirtyTargets = new Set();
   let snapTimer = null;
   let idleFlushTimer = null;
   let projectSyncTimer = null;
+  let projectSyncBusy = false;
+  let pendingImportBuffer = null;
+  let spriteStateTimer = null;
+  const pendingSpriteStates = new Set();
   let localSeq = 0;
   const lastApplied = new Map();
   const lastSentHash = new Map(); 
@@ -536,6 +557,10 @@
     suppressSendUntil = Math.max(suppressSendUntil, Date.now() + (ms || 900));
     dirtyTargets.clear();
     clearTimeout(snapTimer);
+  }
+
+  function clearOutboundSilence() {
+    suppressSendUntil = 0;
   }
 
   function mergeVariables(target, variables) {
@@ -767,20 +792,202 @@
     }, 100);
   }
 
-  function scheduleProjectSync(delayMs) {
+  function scheduleProjectSync(delayMs, force) {
     if (!transport || !transport.connected) return;
-    if (Date.now() < suppressSendUntil) return;
+    if (!force && Date.now() < suppressSendUntil) return;
+    if (projectSyncBusy) {
+      // Retry once the in-flight sync finishes.
+      clearTimeout(projectSyncTimer);
+      projectSyncTimer = setTimeout(
+        () => scheduleProjectSync(delayMs == null ? 700 : delayMs, force),
+        500
+      );
+      return;
+    }
     clearTimeout(projectSyncTimer);
     projectSyncTimer = setTimeout(() => {
-      if (!canSendSync()) return;
-      if (isDragging()) {
-        scheduleProjectSync(200);
+      if (!transport || !transport.connected) return;
+      if (projectSyncBusy) {
+        scheduleProjectSync(400, force);
         return;
       }
-      silenceOutbound(1500);
-      log("project sync send");
+      if (!force) {
+        if (!canSendSync()) return;
+        if (isDragging()) {
+          scheduleProjectSync(250, false);
+          return;
+        }
+      } else {
+        clearOutboundSilence();
+        pauseEventHandling = false;
+      }
+      log("project sync send", force ? "(forced)" : "");
       sendProjectTo(transport);
     }, delayMs == null ? 700 : delayMs);
+  }
+
+  function scheduleSpriteStateFlush(name, delayMs) {
+    if (!transport || !transport.connected) return;
+    if (pauseEventHandling || Date.now() < suppressSendUntil) return;
+    const targetNameStr =
+      typeof name === "string" && name
+        ? name
+        : targetName(vm.editingTarget);
+    if (!targetNameStr || targetNameStr === STAGE_NAME) return;
+    pendingSpriteStates.add(targetNameStr);
+    clearTimeout(spriteStateTimer);
+    spriteStateTimer = setTimeout(
+      flushSpriteStates,
+      delayMs == null ? SPRITE_STATE_FLUSH_MS : delayMs
+    );
+  }
+
+  function flushSpriteStates() {
+    spriteStateTimer = null;
+    if (!transport || !transport.connected || pauseEventHandling) {
+      pendingSpriteStates.clear();
+      return;
+    }
+    const names = [...pendingSpriteStates];
+    pendingSpriteStates.clear();
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      const target = nameToTarget(name);
+      if (!target || target.isStage) continue;
+      broadcastRaw({
+        bc: "spos",
+        user: transport.username,
+        target: name,
+        x: target.x,
+        y: target.y,
+        direction: target.direction,
+        size: target.size,
+        visible: !!target.visible,
+        draggable: !!target.draggable,
+        rotationStyle: target.rotationStyle,
+      });
+    }
+  }
+
+  function applySpriteState(payload) {
+    if (!payload || !payload.target) return;
+    const target = nameToTarget(payload.target);
+    if (!target || target.isStage) return;
+    pauseEventHandling = true;
+    try {
+      const x = Number(payload.x);
+      const y = Number(payload.y);
+      if (typeof target.setXY === "function") {
+        target.setXY(
+          Number.isFinite(x) ? x : target.x,
+          Number.isFinite(y) ? y : target.y,
+          true
+        );
+      } else {
+        if (Number.isFinite(x)) target.x = x;
+        if (Number.isFinite(y)) target.y = y;
+      }
+      if (
+        typeof payload.direction === "number" &&
+        typeof target.setDirection === "function"
+      ) {
+        target.setDirection(payload.direction);
+      }
+      if (typeof payload.size === "number" && typeof target.setSize === "function") {
+        target.setSize(payload.size);
+      }
+      if (
+        typeof payload.visible === "boolean" &&
+        typeof target.setVisible === "function"
+      ) {
+        target.setVisible(payload.visible);
+      }
+      if (typeof payload.draggable === "boolean") {
+        if (typeof target.setDraggable === "function") {
+          target.setDraggable(payload.draggable);
+        } else {
+          target.draggable = payload.draggable;
+        }
+      }
+      if (
+        payload.rotationStyle &&
+        typeof target.setRotationStyle === "function"
+      ) {
+        target.setRotationStyle(payload.rotationStyle);
+      }
+      if (typeof runtime.requestRedraw === "function") runtime.requestRedraw();
+      refreshSpritePosFinger();
+    } catch (e) {
+      logWarn("applySpriteState failed", e);
+    } finally {
+      pauseEventHandling = false;
+    }
+  }
+
+  let spritePosFinger = "";
+  let spritePosPollTimer = null;
+
+  function refreshSpritePosFinger() {
+    const parts = [];
+    const targets = runtime.targets || [];
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i];
+      if (!t || t.isStage) continue;
+      parts.push(
+        `${targetName(t)}:${t.x},${t.y},${t.direction},${t.size},${!!t.visible},${t.rotationStyle}`
+      );
+    }
+    spritePosFinger = parts.join("|");
+  }
+
+  function pollSpritePositions() {
+    if (!transport || !transport.connected || pauseEventHandling) return;
+    if (Date.now() < suppressSendUntil) return;
+    const parts = [];
+    const targets = runtime.targets || [];
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i];
+      if (!t || t.isStage) continue;
+      parts.push(
+        `${targetName(t)}:${t.x},${t.y},${t.direction},${t.size},${!!t.visible},${t.rotationStyle}`
+      );
+    }
+    const finger = parts.join("|");
+    if (finger === spritePosFinger) return;
+    const prevMap = new Map();
+    if (spritePosFinger) {
+      const prevParts = spritePosFinger.split("|");
+      for (let i = 0; i < prevParts.length; i++) {
+        const part = prevParts[i];
+        const idx = part.indexOf(":");
+        if (idx > 0) prevMap.set(part.slice(0, idx), part);
+      }
+    }
+    spritePosFinger = finger;
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i];
+      if (!t || t.isStage) continue;
+      const name = targetName(t);
+      const token = `${name}:${t.x},${t.y},${t.direction},${t.size},${!!t.visible},${t.rotationStyle}`;
+      if (prevMap.get(name) !== token) {
+        scheduleSpriteStateFlush(name, SPRITE_STATE_FLUSH_MS);
+      }
+    }
+  }
+
+  function startSpritePosPolling() {
+    if (spritePosPollTimer) return;
+    refreshSpritePosFinger();
+    spritePosPollTimer = setInterval(pollSpritePositions, 250);
+  }
+
+  function stopSpritePosPolling() {
+    if (!spritePosPollTimer) return;
+    clearInterval(spritePosPollTimer);
+    spritePosPollTimer = null;
+    pendingSpriteStates.clear();
+    clearTimeout(spriteStateTimer);
+    spriteStateTimer = null;
   }
 
   function flushDirtySnapshots() {
@@ -933,15 +1140,98 @@
     broadcastRaw({ bc: "sync", msg });
   }
 
+  function bufferFromArg(arg) {
+    if (!arg) return null;
+    if (arg instanceof ArrayBuffer) return arg;
+    if (ArrayBuffer.isView(arg)) {
+      return arg.buffer.slice(arg.byteOffset, arg.byteOffset + arg.byteLength);
+    }
+    if (arg && typeof arg === "object" && typeof arg.__pangBuf === "string") {
+      return base64ToBuf(arg.__pangBuf);
+    }
+    return null;
+  }
+
+  async function sendSpriteBuffer(name, buf) {
+    if (!transport || !transport.connected || !buf) return;
+    const b64 = bufToBase64(buf);
+    const id =
+      Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
+    const parts = Math.ceil(b64.length / CHUNK_SIZE);
+    broadcastRaw({ bc: "sp-start", id, parts, name });
+    for (let i = 0; i < parts; i++) {
+      broadcastRaw({
+        bc: "sp-part",
+        id,
+        i,
+        data: b64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+      });
+      if (i % 4 === 3) await sleep(8);
+    }
+    broadcastRaw({ bc: "sp-end", id });
+    log("sent chunked sprite", name, parts, "parts");
+  }
+
+  async function handleSpritePart(payload) {
+    if (payload.bc === "sp-start") {
+      spriteChunks.set(payload.id, {
+        parts: payload.parts,
+        chunks: [],
+        name: payload.name || "addsprite",
+      });
+      return;
+    }
+    if (payload.bc === "sp-part") {
+      const entry = spriteChunks.get(payload.id);
+      if (entry) entry.chunks[payload.i] = payload.data;
+      return;
+    }
+    if (payload.bc !== "sp-end") return;
+    const entry = spriteChunks.get(payload.id);
+    spriteChunks.delete(payload.id);
+    if (!entry) return;
+    const b64 = entry.chunks.join("");
+    if (!b64) return;
+    const buf = base64ToBuf(b64);
+    const action = proxyActions[entry.name];
+    if (!action) return;
+    pauseEventHandling = true;
+    const savedEdit = rememberEditingTarget();
+    try {
+      await action("linguini", { args: [buf] });
+      restoreEditingTarget(savedEdit);
+      vm.emitTargetsUpdate();
+    } catch (e) {
+      logErr("remote sprite buffer apply failed", e);
+    } finally {
+      pauseEventHandling = false;
+    }
+  }
+
   function proxyMethod(original, name, serializeArgs) {
     proxyActions[name] = function (...args) {
       if (args[0] === "linguini") {
         const data = args[1];
-        const callArgs = data.args || [];
+        const callArgs = (data.args || []).map((a) => {
+          const buf = bufferFromArg(a);
+          return buf || a;
+        });
         return original.apply(vm, callArgs);
       }
       if (pauseEventHandling) return original.apply(vm, args);
       const result = original.apply(vm, args);
+      const rawBuf = bufferFromArg(args[0]);
+      if (rawBuf && name === "addsprite") {
+        Promise.resolve(result)
+          .then(() => sendSpriteBuffer("addsprite", rawBuf))
+          .catch((e) => logErr("send sprite buffer", e))
+          .finally(() => {
+            markDirty(targetName(vm.editingTarget));
+            scheduleSnapshotFlush(400);
+            scheduleProjectSync(900);
+          });
+        return result;
+      }
       sendSpriteProxy({
         meta: "sprite.proxy",
         data: { name, args: serializeArgs ? serializeArgs(args) : args },
@@ -965,26 +1255,39 @@
     };
   }
 
-  async function resolveExtensionForShare(url) {
-    const u = String(url || "").trim();
-    if (!u) return null;
-    if (/^https?:\/\//i.test(u) || u.startsWith("data:")) {
-      return { kind: "url", url: u };
-    }
-    if (u.startsWith("blob:")) {
-      try {
-        const text = await (await fetch(u)).text();
+  async function resolveExtensionForShare(urlOrFile) {
+    try {
+      if (urlOrFile && typeof urlOrFile === "object") {
+        if (typeof urlOrFile.text === "function") {
+          const text = await urlOrFile.text();
+          if (!text) return null;
+          return { kind: "source", source: text };
+        }
+        if (urlOrFile instanceof ArrayBuffer) {
+          const text = new TextDecoder("utf-8").decode(urlOrFile);
+          if (!text) return null;
+          return { kind: "source", source: text };
+        }
+      }
+      const u = String(urlOrFile || "").trim();
+      if (!u) return null;
+      if (/^https?:\/\//i.test(u) || u.startsWith("data:")) {
+        return { kind: "url", url: u };
+      }
+      if (u.startsWith("blob:")) {
+        const res = await fetch(u);
+        const text = await res.text();
         if (!text) return null;
         return { kind: "source", source: text };
-      } catch (e) {
-        logWarn("blob extension read failed", e);
-        return null;
       }
+      return { kind: "url", url: u };
+    } catch (e) {
+      logWarn("resolve extension failed", e);
+      return null;
     }
-    return { kind: "url", url: u };
   }
 
-  function sendExtensionChunks(text, mode) {
+  async function sendExtensionChunks(text, mode) {
     const body = String(text || "");
     if (!body) return;
     const id =
@@ -998,21 +1301,21 @@
         i,
         data: body.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
       });
+      if (i % 4 === 3) await sleep(8);
     }
     broadcastRaw({ bc: "ext-end", id });
     log("sent chunked extension", mode || "source", parts, "parts");
   }
 
-  async function shareLoadedExtension(url) {
-    if (!transport || !transport.connected || pauseEventHandling) return;
+  async function shareResolvedExtension(resolved) {
+    if (!transport || !transport.connected) return;
+    if (!resolved) return;
     try {
-      const resolved = await resolveExtensionForShare(url);
-      if (!resolved) return;
       if (resolved.kind === "url") {
         if (resolved.url.length <= CHUNK_SIZE) {
           broadcastRaw({ bc: "ext", url: resolved.url });
         } else {
-          sendExtensionChunks(resolved.url, "url");
+          await sendExtensionChunks(resolved.url, "url");
         }
         log("shared extension url");
         return;
@@ -1020,10 +1323,41 @@
       if (resolved.source.length <= CHUNK_SIZE) {
         broadcastRaw({ bc: "ext", source: resolved.source });
       } else {
-        sendExtensionChunks(resolved.source, "source");
+        await sendExtensionChunks(resolved.source, "source");
       }
+      log("shared extension source", resolved.source.length);
     } catch (e) {
-      logErr("shareLoadedExtension", e);
+      logErr("shareResolvedExtension", e);
+    }
+  }
+
+  async function withExtensionLoadPermissions(run) {
+    const em = vm.extensionManager;
+    const sm = em && em.securityManager;
+    if (!sm) return run();
+    const saved = {};
+    try {
+      if (typeof sm.getSandboxMode === "function") {
+        saved.getSandboxMode = sm.getSandboxMode;
+        sm.getSandboxMode = function () {
+          return "unsandboxed";
+        };
+      }
+      if (typeof sm.canLoadExtensionFromProject === "function") {
+        saved.canLoadExtensionFromProject = sm.canLoadExtensionFromProject;
+        sm.canLoadExtensionFromProject = function () {
+          return Promise.resolve(true);
+        };
+      }
+      return await run();
+    } finally {
+      for (const key of Object.keys(saved)) {
+        try {
+          sm[key] = saved[key];
+        } catch {
+          
+        }
+      }
     }
   }
 
@@ -1032,25 +1366,81 @@
     if (!em || typeof em.loadExtensionURL !== "function") return;
 
     let url = payload && payload.url ? String(payload.url) : "";
-    let createdBlob = null;
-    if (!url && payload && payload.source) {
-      createdBlob = URL.createObjectURL(
-        new Blob([String(payload.source)], {
-          type: "application/javascript",
-        })
-      );
-      url = createdBlob;
+    let source = payload && payload.source ? String(payload.source) : "";
+    if (!url && source) {
+      try {
+        url =
+          "data:text/javascript;charset=utf-8," + encodeURIComponent(source);
+      } catch {
+        url = URL.createObjectURL(
+          new Blob([source], { type: "application/javascript" })
+        );
+      }
     }
     if (!url) return;
 
     pauseEventHandling = true;
     try {
-      await em.loadExtensionURL(url);
-      log("loaded remote extension");
+      await withExtensionLoadPermissions(async () => {
+        try {
+          await em.loadExtensionURL(url);
+          log("loaded remote extension");
+          return;
+        } catch (e) {
+          logWarn("remote extension load failed, trying blob", e);
+        }
+        if (!source && url.indexOf("data:") === 0) {
+          // already data url
+        }
+        if (source) {
+          const blobUrl = URL.createObjectURL(
+            new Blob([source], { type: "application/javascript" })
+          );
+          await em.loadExtensionURL(blobUrl);
+          log("loaded remote extension via blob");
+        } else {
+          throw new Error("extension load failed");
+        }
+      });
     } catch (e) {
       logErr("remote extension load failed", e);
     } finally {
       pauseEventHandling = false;
+    }
+  }
+
+  async function shareLoadedCustomExtensions() {
+    if (!transport || !transport.connected) return;
+    const em = vm.extensionManager;
+    if (!em) return;
+    const urls = [];
+    try {
+      if (em.extensionURLs && typeof em.extensionURLs.forEach === "function") {
+        em.extensionURLs.forEach((url) => {
+          if (url) urls.push(String(url));
+        });
+      } else if (em.extensionURLs && typeof em.extensionURLs === "object") {
+        for (const url of Object.values(em.extensionURLs)) {
+          if (url) urls.push(String(url));
+        }
+      }
+    } catch (e) {
+      logWarn("read extensionURLs failed", e);
+    }
+    const seen = new Set();
+    for (const url of urls) {
+      if (seen.has(url)) continue;
+      seen.add(url);
+      // Builtin extension ids are not URLs — skip.
+      if (
+        !/^https?:\/\//i.test(url) &&
+        !url.startsWith("data:") &&
+        !url.startsWith("blob:")
+      ) {
+        continue;
+      }
+      const resolved = await resolveExtensionForShare(url);
+      if (resolved) await shareResolvedExtension(resolved);
     }
   }
 
@@ -1082,16 +1472,172 @@
     em.__pangliveExtHooked = true;
     const original = em.loadExtensionURL.bind(em);
     em.loadExtensionURL = function (url) {
+      // Prefetch blob/File contents before the editor revokes them.
+      const shouldShare = !pauseEventHandling;
+      const resolvedPromise = shouldShare
+        ? resolveExtensionForShare(url)
+        : null;
       const result = original(url);
-      if (!pauseEventHandling) {
-        Promise.resolve(result)
-          .then(() => shareLoadedExtension(url))
-          .catch((e) => logWarn("extension load failed", e));
+      if (resolvedPromise) {
+        Promise.all([Promise.resolve(result), resolvedPromise])
+          .then(async ([, resolved]) => {
+            await shareResolvedExtension(resolved);
+          })
+          .catch((e) => logWarn("extension load/share failed", e));
       }
       return result;
     };
     log("extensionManager.loadExtensionURL hooked");
     return true;
+  }
+
+  function captureProjectInput(input) {
+    try {
+      if (!input) return null;
+      if (input instanceof ArrayBuffer) return input.slice(0);
+      if (ArrayBuffer.isView(input)) {
+        return input.buffer.slice(
+          input.byteOffset,
+          input.byteOffset + input.byteLength
+        );
+      }
+      if (typeof Blob !== "undefined" && input instanceof Blob) {
+        return { __blob: input };
+      }
+      return null;
+    } catch (e) {
+      logWarn("captureProjectInput failed", e);
+      return null;
+    }
+  }
+
+  async function resolveCapturedProject(captured) {
+    if (!captured) return null;
+    if (captured instanceof ArrayBuffer) return captured;
+    if (captured && captured.__blob) {
+      return await captured.__blob.arrayBuffer();
+    }
+    return null;
+  }
+
+  function isProjectFileName(name) {
+    return /\.(pmp|sb3|sb2|pmps)$/i.test(String(name || ""));
+  }
+
+  function installProjectFileCapture() {
+    if (window.__pangliveFileCapture) return;
+    window.__pangliveFileCapture = true;
+    document.addEventListener(
+      "change",
+      (e) => {
+        const el = e.target;
+        if (!el || el.tagName !== "INPUT" || el.type !== "file") return;
+        const file = el.files && el.files[0];
+        if (!file || !isProjectFileName(file.name)) return;
+        if (!transport || !transport.connected) return;
+        file
+          .arrayBuffer()
+          .then((buf) => {
+            pendingImportBuffer = buf.slice(0);
+            log("captured project file", file.name, buf.byteLength);
+          })
+          .catch((err) => logWarn("project file capture failed", err));
+      },
+      true
+    );
+  }
+
+  async function sharePendingOrSavedProject() {
+    if (!transport || !transport.connected) return;
+    clearOutboundSilence();
+    const raw = await resolveCapturedProject(pendingImportBuffer);
+    pendingImportBuffer = null;
+    if (raw && raw.byteLength > 0) {
+      log("sharing project bytes", raw.byteLength);
+      await sendProjectTo(transport, raw);
+    } else {
+      log("sharing via saveProjectSb3 fallback");
+      await sendProjectTo(transport, null);
+    }
+    try {
+      await shareLoadedCustomExtensions();
+    } catch (e) {
+      logWarn("share extensions after project", e);
+    }
+  }
+
+  function installLoadProjectHook() {
+    if (vm.__pangliveLoadProjectHooked) return;
+    if (typeof vm.loadProject !== "function") return;
+    vm.__pangliveLoadProjectHooked = true;
+    installProjectFileCapture();
+    const original = vm.loadProject.bind(vm);
+    vm.loadProject = function (input) {
+      const wasPaused = pauseEventHandling;
+      pauseEventHandling = true;
+      silenceOutbound(4000);
+      clearTimeout(projectSyncTimer);
+      stopSpritePosPolling();
+
+      const captured = wasPaused ? null : captureProjectInput(input);
+      // Prefer file-input capture if present; otherwise use loadProject argument.
+      if (!wasPaused && captured && !pendingImportBuffer) {
+        pendingImportBuffer = captured;
+      } else if (!wasPaused && captured) {
+        // Keep whichever is larger (full zip vs maybe smaller arg).
+        Promise.resolve(resolveCapturedProject(captured)).then((buf) => {
+          if (
+            buf &&
+            (!pendingImportBuffer ||
+              (pendingImportBuffer instanceof ArrayBuffer &&
+                buf.byteLength >= pendingImportBuffer.byteLength))
+          ) {
+            pendingImportBuffer = buf;
+          }
+        });
+      }
+
+      const finish = (ok) => {
+        pauseEventHandling = wasPaused;
+        refreshSpritePosFinger();
+        if (transport && transport.connected) startSpritePosPolling();
+        if (ok && !wasPaused && transport && transport.connected) {
+          // Wait for assets/extensions to settle, then push the real file bytes.
+          setTimeout(() => {
+            sharePendingOrSavedProject().catch((e) => {
+              logErr("post-import project share failed", e);
+              scheduleProjectSync(800, true);
+            });
+          }, 900);
+        } else {
+          if (!wasPaused) pendingImportBuffer = null;
+          silenceOutbound(800);
+        }
+      };
+
+      let result;
+      try {
+        result = original(input);
+      } catch (e) {
+        finish(false);
+        throw e;
+      }
+      if (result && typeof result.then === "function") {
+        return result.then(
+          (v) => {
+            finish(true);
+            return v;
+          },
+          (err) => {
+            finish(false);
+            throw err;
+          }
+        );
+      }
+      finish(true);
+      return result;
+    };
+    log("vm.loadProject hooked");
   }
 
   function installHooks() {
@@ -1101,11 +1647,18 @@
 
     startWorkspaceHookPolling();
     installExtensionHooks();
+    installLoadProjectHook();
+    installProjectFileCapture();
     vm.on("workspaceUpdate", hookWorkspaceListener);
     vm.on("PROJECT_LOADED", () => {
       hookWorkspaceListener();
       installExtensionHooks();
-      silenceOutbound(500);
+      // Don't silence here if a forced project sync is pending — that used to
+      // cancel sharing after File > Load.
+      if (!projectSyncBusy && !projectSyncTimer) {
+        silenceOutbound(800);
+      }
+      refreshSpritePosFinger();
     });
 
     vm.addSprite = proxyMethod(vm.addSprite.bind(vm), "addsprite", (a) => a);
@@ -1149,6 +1702,39 @@
       }
     }
 
+    if (typeof vm.postSpriteInfo === "function" && !vm.__panglivePostSprite) {
+      vm.__panglivePostSprite = true;
+      const origPost = vm.postSpriteInfo.bind(vm);
+      vm.postSpriteInfo = function (data) {
+        const ret = origPost(data);
+        if (!pauseEventHandling) {
+          scheduleSpriteStateFlush(targetName(vm.editingTarget), 80);
+        }
+        return ret;
+      };
+    }
+
+    if (typeof vm.reorderTarget === "function" && !proxyActions.reordertarget) {
+      vm.reorderTarget = proxyMethod(
+        vm.reorderTarget.bind(vm),
+        "reordertarget",
+        (a) => a
+      );
+    }
+
+    if (!runtime.__pangliveTargetMoved) {
+      runtime.__pangliveTargetMoved = true;
+      const onTargetMoved = (target) => {
+        if (pauseEventHandling) return;
+        scheduleSpriteStateFlush(targetName(target), SPRITE_STATE_FLUSH_MS);
+      };
+      try {
+        runtime.on("TARGET_MOVED", onTargetMoved);
+      } catch {
+        
+      }
+    }
+
     let workspaceUpdateQueued = false;
     const origEmitWorkspaceUpdate = vm.emitWorkspaceUpdate.bind(vm);
     vm.emitWorkspaceUpdate = function () {
@@ -1167,6 +1753,9 @@
   }
 
   async function saveProjectBytes() {
+    if (typeof vm.saveProjectSb3 !== "function") {
+      throw new Error("saveProjectSb3 unavailable");
+    }
     let out = await vm.saveProjectSb3("arraybuffer");
     if (out instanceof Blob) out = await out.arrayBuffer();
     return out;
@@ -1197,8 +1786,9 @@
   }
 
   async function loadProjectBytes(buf) {
+    // vm.loadProject is hooked; pause before call so it won't schedule a re-sync.
     pauseEventHandling = true;
-    silenceOutbound(2000);
+    silenceOutbound(4000);
     dirtyTargets.clear();
     playAfterDrag.length = 0;
     lastApplied.clear();
@@ -1210,6 +1800,7 @@
       vm.emitTargetsUpdate();
       vm.emitWorkspaceUpdate();
       hookWorkspaceListener();
+      refreshSpritePosFinger();
     } catch (e) {
       logErr("loadProjectBytes failed", e);
     } finally {
@@ -1259,43 +1850,206 @@
     }
   }
 
-  async function sendProjectTo(t) {
+  async function waitPeerBuffers(t) {
+    if (!t) return;
+    for (let n = 0; n < 120; n++) {
+      const conns = [];
+      if (t.isHost) {
+        for (const c of t._conns.values()) conns.push(c);
+      } else if (t._hostConn) {
+        conns.push(t._hostConn);
+      }
+      let overloaded = false;
+      for (let i = 0; i < conns.length; i++) {
+        const c = conns[i];
+        if (!c || !c.open) continue;
+        const buffered =
+          typeof c.bufferSize === "number"
+            ? c.bufferSize
+            : c.dataChannel && typeof c.dataChannel.bufferedAmount === "number"
+              ? c.dataChannel.bufferedAmount
+              : 0;
+        if (buffered > 512 * 1024) {
+          overloaded = true;
+          break;
+        }
+      }
+      if (!overloaded) return;
+      await sleep(40);
+    }
+  }
+
+  async function sendProjectTo(t, preBuf) {
+    if (projectSyncBusy) {
+      logWarn("project sync already in progress");
+      return;
+    }
+    if (!t || !t.connected) {
+      logWarn("project sync skipped: not connected");
+      return;
+    }
+    projectSyncBusy = true;
+    silenceOutbound(8000);
     try {
-      const buf = await saveProjectBytes();
-      log("sendProjectTo", buf.byteLength, "bytes");
-      const b64 = bufToBase64(buf);
-      const id = Date.now().toString(36);
-      const parts = Math.ceil(b64.length / CHUNK_SIZE);
-      t.broadcast({ bc: "p-start", id, parts });
+      let buf = preBuf;
+      if (!buf || !(buf instanceof ArrayBuffer) || buf.byteLength < 1) {
+        buf = await saveProjectBytes();
+      }
+      if (!buf || buf.byteLength < 1) {
+        throw new Error("empty project buffer");
+      }
+      const bytes = new Uint8Array(buf);
+      const id =
+        Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 6);
+      const parts = Math.ceil(bytes.length / CHUNK_SIZE);
+      log("sendProjectTo", bytes.length, "bytes", parts, "parts");
+      t.broadcast({
+        bc: "p-start",
+        id,
+        parts,
+        bytes: bytes.length,
+        ver: 2,
+      });
       for (let i = 0; i < parts; i++) {
-        t.broadcast({
+        const slice = bytes.subarray(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+        // Standalone copy so PeerJS/MessagePack owns the memory.
+        const chunk = new Uint8Array(slice.length);
+        chunk.set(slice);
+        const ok = t.broadcast({
           bc: "p-part",
           id,
           i,
-          data: b64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+          ver: 2,
+          bin: chunk,
         });
+        if (!ok) {
+          await sleep(80);
+          t.broadcast({
+            bc: "p-part",
+            id,
+            i,
+            ver: 2,
+            bin: chunk,
+          });
+        }
+        await waitPeerBuffers(t);
+        await sleep(20);
       }
-      t.broadcast({ bc: "p-end", id });
+      await waitPeerBuffers(t);
+      await sleep(60);
+      t.broadcast({ bc: "p-end", id, parts, ver: 2, bytes: bytes.length });
       log("sendProjectTo done", id, parts, "parts");
     } catch (e) {
       logErr("send project", e);
+    } finally {
+      projectSyncBusy = false;
+      silenceOutbound(1000);
     }
+  }
+
+  function chunkToUint8(data) {
+    if (!data) return null;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) {
+      return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    }
+    if (Array.isArray(data)) return new Uint8Array(data);
+    if (typeof data === "string") {
+      // Legacy base64 chunk
+      try {
+        return new Uint8Array(base64ToBuf(data));
+      } catch {
+        return null;
+      }
+    }
+    // MessagePack sometimes decodes as object with numeric keys
+    if (typeof data === "object" && data !== null) {
+      if (typeof data.length === "number") {
+        try {
+          return new Uint8Array(data);
+        } catch {
+          
+        }
+      }
+    }
+    return null;
   }
 
   function handleProjectPart(payload, onReady) {
     if (payload.bc === "p-start") {
-      log("recv project start", payload.id, payload.parts, "parts");
-      projectChunks.set(payload.id, { parts: payload.parts, chunks: [] });
+      log(
+        "recv project start",
+        payload.id,
+        payload.parts,
+        "parts",
+        payload.bytes || "?",
+        "bytes",
+        "ver",
+        payload.ver || 1
+      );
+      projectChunks.set(payload.id, {
+        parts: payload.parts,
+        chunks: [],
+        got: 0,
+        bytes: payload.bytes || 0,
+        ver: payload.ver || 1,
+      });
     } else if (payload.bc === "p-part") {
       const entry = projectChunks.get(payload.id);
-      if (entry) entry.chunks[payload.i] = payload.data;
+      if (!entry) return;
+      const piece = chunkToUint8(payload.bin != null ? payload.bin : payload.data);
+      if (!piece) {
+        logWarn("bad project chunk", payload.id, payload.i);
+        return;
+      }
+      if (!entry.chunks[payload.i]) entry.got += 1;
+      entry.chunks[payload.i] = piece;
     } else if (payload.bc === "p-end") {
       const entry = projectChunks.get(payload.id);
-      projectChunks.delete(payload.id);
       if (!entry) return;
-      const b64 = entry.chunks.join("");
-      log("recv project end", payload.id, b64.length, "b64 chars");
-      if (b64) onReady(base64ToBuf(b64));
+      const expectedParts = entry.parts || payload.parts || 0;
+      const tryAssemble = (attempt) => {
+        let missing = 0;
+        let total = 0;
+        for (let i = 0; i < expectedParts; i++) {
+          const c = entry.chunks[i];
+          if (!c) missing += 1;
+          else total += c.byteLength || c.length || 0;
+        }
+        if (missing > 0) {
+          if (attempt < 50) {
+            setTimeout(() => tryAssemble(attempt + 1), 100);
+            return;
+          }
+          logWarn(
+            "project chunks incomplete",
+            payload.id,
+            "missing",
+            missing,
+            "/",
+            expectedParts
+          );
+          projectChunks.delete(payload.id);
+          return;
+        }
+        projectChunks.delete(payload.id);
+        const out = new Uint8Array(total);
+        let offset = 0;
+        for (let i = 0; i < expectedParts; i++) {
+          const c = entry.chunks[i];
+          out.set(c, offset);
+          offset += c.byteLength || c.length;
+        }
+        log("recv project end", payload.id, out.byteLength, "bytes");
+        setTimeout(() => {
+          try {
+            onReady(out.buffer);
+          } catch (e) {
+            logErr("project decode/load", e);
+          }
+        }, 0);
+      };
+      tryAssemble(0);
     }
   }
 
@@ -1357,27 +2111,130 @@
       this.onPayload = null;
       this.onStatus = null;
       this.onChat = null;
+      this.onTyping = null;
       this._projectTimer = null;
       this._projectRequested = false;
       this._conns = new Map();
       this._connUsers = new Map();
       this._hostConn = null;
       this._gen = 0;
+      this._typingOn = false;
+      this._lastSeen = new Map();
+      this._hostLastSeen = 0;
+      this._kaTimer = null;
     }
 
-    setHandlers({ onPresence, onPayload, onStatus, onChat }) {
+    setHandlers({ onPresence, onPayload, onStatus, onChat, onTyping }) {
       this.onPresence = onPresence;
       this.onPayload = onPayload;
       this.onStatus = onStatus;
       this.onChat = onChat;
+      this.onTyping = onTyping;
     }
 
     sendChat(text) {
       const msg = String(text || "").trim().slice(0, 200);
       if (!msg || !this.connected) return null;
+      this.sendTyping(false);
       const payload = { bc: "msg", user: this.username, text: msg };
       this.broadcast(payload);
       return payload;
+    }
+
+    sendTyping(on) {
+      if (!this.connected) return;
+      const next = !!on;
+      if (this._typingOn === next) return;
+      this._typingOn = next;
+      this.broadcast({
+        bc: "typing",
+        user: this.username,
+        on: next,
+      });
+    }
+
+    announceBye() {
+      if (!this.username) return;
+      try {
+        this.broadcast({ bc: "bye", user: this.username });
+      } catch {
+        
+      }
+    }
+
+    _touchUser(user) {
+      if (!user) return;
+      this._lastSeen.set(user, Date.now());
+    }
+
+    _startKeepAlive() {
+      this._stopKeepAlive();
+      this._touchUser(this.username);
+      this._hostLastSeen = Date.now();
+      this._kaTimer = setInterval(() => this._keepAliveTick(), KEEP_ALIVE_MS);
+    }
+
+    _stopKeepAlive() {
+      if (this._kaTimer) {
+        clearInterval(this._kaTimer);
+        this._kaTimer = null;
+      }
+      this._lastSeen.clear();
+      this._hostLastSeen = 0;
+    }
+
+    _dropGhost(user) {
+      if (!user || user === this.username) return;
+      this.onlineUsers.delete(user);
+      this._lastSeen.delete(user);
+      removeRemoteCursor(user);
+      for (const [peerId, u] of [...this._connUsers.entries()]) {
+        if (u !== user) continue;
+        const conn = this._conns.get(peerId);
+        this._conns.delete(peerId);
+        this._connUsers.delete(peerId);
+        try {
+          conn?.close();
+        } catch {
+          
+        }
+      }
+      this._emitPresence();
+      if (this.isHost) {
+        this.broadcast({ bc: "bye", user });
+      }
+    }
+
+    _keepAliveTick() {
+      if (!this.connected) return;
+      this.broadcast({ bc: "ping", user: this.username, t: Date.now() });
+      const now = Date.now();
+
+      if (!this.isHost) {
+        if (this._hostLastSeen && now - this._hostLastSeen > GHOST_TIMEOUT_MS) {
+          logWarn("host keepalive timeout");
+          stopCursorTracking();
+          stopSpritePosPolling();
+          this._stopKeepAlive();
+          this.connected = false;
+          this._status("idle", "Host disconnected");
+          this.disconnect(true);
+          return;
+        }
+      }
+
+      for (const user of [...this.onlineUsers]) {
+        if (user === this.username) continue;
+        const last = this._lastSeen.get(user);
+        if (last == null) {
+          this._touchUser(user);
+          continue;
+        }
+        if (now - last > GHOST_TIMEOUT_MS) {
+          logWarn("ghost timeout", user);
+          this._dropGhost(user);
+        }
+      }
     }
 
     _status(state, detail) {
@@ -1402,16 +2259,17 @@
     broadcast(obj, exceptConn) {
       if (!this.connected) {
         logWarn("broadcast blocked not connected", obj && obj.bc);
-        return;
+        return false;
       }
+      let any = false;
       if (this.isHost) {
         for (const conn of this._conns.values()) {
           if (conn === exceptConn) continue;
-          this._sendConn(conn, obj);
+          if (this._sendConn(conn, obj)) any = true;
         }
-        return;
+        return any;
       }
-      this._sendConn(this._hostConn, obj);
+      return this._sendConn(this._hostConn, obj);
     }
 
     _wireConn(conn, asHostSide) {
@@ -1438,11 +2296,15 @@
           this._hostConn = conn;
           this.connected = true;
           this._projectRequested = true;
+          this._hostLastSeen = Date.now();
           this._status("connected", "Connected");
           this.broadcast({ bc: "here", user: this.username });
           setTimeout(() => this.broadcast({ bc: "need-project" }), 400);
           installHooks();
           startCursorTracking();
+          startSpritePosPolling();
+          installProjectFileCapture();
+          this._startKeepAlive();
           this._emitPresence();
           log("connected to host", peerId);
         }
@@ -1461,6 +2323,7 @@
 
       if (user) {
         this.onlineUsers.delete(user);
+        this._lastSeen.delete(user);
         removeRemoteCursor(user);
         this._emitPresence();
         if (this.isHost) {
@@ -1479,6 +2342,7 @@
     _markUser(user, conn) {
       if (!user || user === this.username) return;
       if (conn) this._connUsers.set(conn.peer, user);
+      this._touchUser(user);
       if (!this.onlineUsers.has(user)) {
         this.onlineUsers.add(user);
         this._emitPresence();
@@ -1488,6 +2352,14 @@
     _handlePayload(payload, fromConn) {
       if (!payload || !payload.bc) return;
       if (payload.bc === "hello") return;
+
+      if (payload.user) this._touchUser(sanitize(payload.user));
+
+      if (payload.bc === "ping") {
+        const user = sanitize(payload.user);
+        this._touchUser(user);
+        return;
+      }
 
       if (payload.bc === "msg") {
         const user = sanitize(payload.user);
@@ -1507,9 +2379,15 @@
         const user = sanitize(payload.user);
         if (user && user !== this.username) {
           this.onlineUsers.delete(user);
+          this._lastSeen.delete(user);
           removeRemoteCursor(user);
           this._emitPresence();
         }
+        return;
+      }
+
+      if (payload.bc === "spos") {
+        applySpriteState(payload);
         return;
       }
 
@@ -1532,6 +2410,23 @@
         payload.bc === "ext-end"
       ) {
         handleExtPart(payload);
+        return;
+      }
+
+      if (
+        payload.bc === "sp-start" ||
+        payload.bc === "sp-part" ||
+        payload.bc === "sp-end"
+      ) {
+        handleSpritePart(payload);
+        return;
+      }
+
+      if (payload.bc === "typing") {
+        const user = sanitize(payload.user);
+        if (!user || user === this.username) return;
+        this._markUser(user, fromConn);
+        this.onTyping?.({ user, on: payload.on !== false });
         return;
       }
 
@@ -1570,6 +2465,9 @@
     }
 
     _onPeerData(data, fromConn) {
+      if (!this.isHost && fromConn && fromConn === this._hostConn) {
+        this._hostLastSeen = Date.now();
+      }
       let payload = data;
       if (typeof data === "string") {
         try {
@@ -1583,6 +2481,8 @@
       this._handlePayload(payload, fromConn);
 
       if (this.isHost && fromConn) {
+        // Don't amplify keepalive storms more than needed; still relay pings
+        // so guests can see each other.
         this.broadcast(payload, fromConn);
       }
     }
@@ -1636,6 +2536,9 @@
           this._status("connected", `Room ${this.room}`);
           installHooks();
           startCursorTracking();
+          startSpritePosPolling();
+          installProjectFileCapture();
+          this._startKeepAlive();
           this._emitPresence();
           return;
         }
@@ -1643,7 +2546,7 @@
         this._status("connecting", "Joining host…");
         const conn = peer.connect(hostId, {
           reliable: true,
-          serialization: "json",
+          serialization: "binary",
         });
         this._wireConn(conn, false);
       });
@@ -1697,8 +2600,13 @@
     }
 
     disconnect(silent) {
+      if (!silent && this.connected) {
+        this.announceBye();
+      }
       this._gen += 1;
       stopCursorTracking();
+      stopSpritePosPolling();
+      this._stopKeepAlive();
       clearTimeout(this._projectTimer);
       this._projectTimer = null;
 
@@ -1737,6 +2645,26 @@
 
   transport = new P2PTransport();
   sendLocalFn = (payload) => transport.broadcast(payload);
+
+  function installPageLeaveHooks() {
+    if (window.__pangliveLeaveHooked) return;
+    window.__pangliveLeaveHooked = true;
+    const leave = () => {
+      try {
+        if (transport && transport.connected) transport.announceBye();
+      } catch {
+        
+      }
+      try {
+        if (transport && transport.peer) transport.peer.destroy();
+      } catch {
+        
+      }
+    };
+    window.addEventListener("pagehide", leave);
+    window.addEventListener("beforeunload", leave);
+  }
+  installPageLeaveHooks();
 
   function injectStyles() {
     if (document.getElementById("panglive-styles")) return;
@@ -1835,7 +2763,9 @@
       #panglive-window.connected .pl-chat { display: flex; }
       .pl-chat-list {
         display: flex; flex-direction: column; gap: 4px;
-        min-height: 72px; max-height: 110px; overflow: hidden;
+        min-height: 72px; max-height: 140px;
+        overflow-x: hidden; overflow-y: auto;
+        overscroll-behavior: contain;
       }
       .pl-chat-empty { font-size: 11px; color: #666; }
       .pl-chat-line {
@@ -1843,6 +2773,10 @@
         word-break: break-word;
       }
       .pl-chat-line b { color: #222; }
+      .pl-chat-typing {
+        min-height: 14px; font-size: 11px; color: #666;
+        font-style: italic;
+      }
       .pl-chat-send { display: flex; gap: 6px; }
       .pl-chat-send .pl-input {
         flex: 1; font-size: 12px; font-weight: 500; text-align: left;
@@ -1934,6 +2868,7 @@
           <div class="pl-chat-list" id="pl-chat-list">
             <div class="pl-chat-empty">No messages yet</div>
           </div>
+          <div class="pl-chat-typing" id="pl-chat-typing"></div>
           <div class="pl-chat-send">
             <input id="pl-chat-input" class="pl-input" maxlength="200" placeholder="Message…" />
             <button class="pl-btn" id="pl-chat-go">Send</button>
@@ -1968,13 +2903,55 @@
     const roomBlock = win.querySelector("#pl-room");
     const chatList = win.querySelector("#pl-chat-list");
     const chatInput = win.querySelector("#pl-chat-input");
+    const chatTypingEl = win.querySelector("#pl-chat-typing");
     const titlebar = win.querySelector(".pl-bar");
     const chatMessages = [];
+    const typingUsers = new Map();
+    let typingTimer = null;
 
     usernameInput.value = randomUsername();
     makeDraggable(titlebar, win);
 
+    function renderTyping() {
+      const names = [...typingUsers.keys()];
+      if (names.length === 0) {
+        chatTypingEl.textContent = "";
+        return;
+      }
+      if (names.length === 1) {
+        chatTypingEl.textContent = `${names[0]} is typing…`;
+        return;
+      }
+      if (names.length === 2) {
+        chatTypingEl.textContent = `${names[0]} and ${names[1]} are typing…`;
+        return;
+      }
+      chatTypingEl.textContent = `${names.length} people are typing…`;
+    }
+
+    function setRemoteTyping(user, on) {
+      if (!user) return;
+      if (on) {
+        typingUsers.set(user, Date.now());
+      } else {
+        typingUsers.delete(user);
+      }
+      renderTyping();
+    }
+
+    function clearTyping() {
+      typingUsers.clear();
+      renderTyping();
+      if (typingTimer) {
+        clearTimeout(typingTimer);
+        typingTimer = null;
+      }
+      transport.sendTyping(false);
+    }
+
     function renderChat() {
+      const nearBottom =
+        chatList.scrollHeight - chatList.scrollTop - chatList.clientHeight < 36;
       if (chatMessages.length === 0) {
         chatList.innerHTML = `<div class="pl-chat-empty">No messages yet</div>`;
         return;
@@ -1985,16 +2962,20 @@
             `<div class="pl-chat-line"><b>${escapeHtml(m.user)}</b>: ${escapeHtml(m.text)}</div>`
         )
         .join("");
+      if (nearBottom) chatList.scrollTop = chatList.scrollHeight;
     }
 
     function pushChat(user, text) {
+      typingUsers.delete(user);
+      renderTyping();
       chatMessages.push({ user, text });
-      while (chatMessages.length > 5) chatMessages.shift();
+      while (chatMessages.length > CHAT_HISTORY) chatMessages.shift();
       renderChat();
     }
 
     function clearChat() {
       chatMessages.length = 0;
+      clearTyping();
       renderChat();
     }
 
@@ -2012,6 +2993,16 @@
       pushChat(payload.user, payload.text);
       chatInput.value = "";
       chatInput.focus();
+    }
+
+    function noteLocalTyping() {
+      if (!transport.connected) return;
+      transport.sendTyping(true);
+      if (typingTimer) clearTimeout(typingTimer);
+      typingTimer = setTimeout(() => {
+        typingTimer = null;
+        transport.sendTyping(false);
+      }, TYPING_IDLE_MS);
     }
 
     win.querySelector("#pl-close").addEventListener("click", () => {
@@ -2078,6 +3069,14 @@
     chatInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") sendChatMessage();
     });
+    chatInput.addEventListener("input", noteLocalTyping);
+    chatList.addEventListener(
+      "wheel",
+      (e) => {
+        e.stopPropagation();
+      },
+      { passive: true }
+    );
 
     transport.setHandlers({
       onPresence: (users) => {
@@ -2091,10 +3090,17 @@
           el.textContent = name.slice(0, 1);
           avatars.appendChild(el);
         });
+        for (const name of [...typingUsers.keys()]) {
+          if (!users.includes(name)) typingUsers.delete(name);
+        }
+        renderTyping();
         pruneRemoteCursors(users);
       },
       onChat: ({ user, text }) => {
         pushChat(user, text);
+      },
+      onTyping: ({ user, on }) => {
+        setRemoteTyping(user, on);
       },
       onStatus: (state, detail) => {
         statusEl.textContent = detail || "";
