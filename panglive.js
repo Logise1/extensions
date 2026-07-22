@@ -2805,6 +2805,9 @@
         word-break: break-word;
       }
       .pl-chat-line b { color: #222; }
+      .pl-chat-line.system {
+        color: #666; font-style: italic;
+      }
       .pl-chat-typing {
         min-height: 14px; font-size: 11px; color: #666;
         font-style: italic;
@@ -2992,10 +2995,12 @@
         return;
       }
       chatList.innerHTML = chatMessages
-        .map(
-          (m) =>
-            `<div class="pl-chat-line"><b>${escapeHtml(m.user)}</b>: ${escapeHtml(m.text)}</div>`
-        )
+        .map((m) => {
+          if (m.system) {
+            return `<div class="pl-chat-line system">${escapeHtml(m.text)}</div>`;
+          }
+          return `<div class="pl-chat-line"><b>${escapeHtml(m.user)}</b>: ${escapeHtml(m.text)}</div>`;
+        })
         .join("");
       if (nearBottom) chatList.scrollTop = chatList.scrollHeight;
     }
@@ -3007,6 +3012,12 @@
       while (chatMessages.length > CHAT_HISTORY) chatMessages.shift();
       renderChat();
       playSfx("msg");
+    }
+
+    function pushSystem(text) {
+      chatMessages.push({ system: true, text });
+      while (chatMessages.length > CHAT_HISTORY) chatMessages.shift();
+      renderChat();
     }
 
     function clearChat() {
@@ -3142,11 +3153,13 @@
         for (const name of users) {
           if (!knownUsers.has(name) && name !== transport.username) {
             playSfx("join");
+            pushSystem(`${name} joined`);
           }
         }
         for (const name of knownUsers) {
           if (!users.includes(name) && name !== transport.username) {
             playSfx("leave");
+            pushSystem(`${name} left`);
           }
         }
         knownUsers = new Set(users);
