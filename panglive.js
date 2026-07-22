@@ -35,29 +35,23 @@
     try {
       let base = sfxCache[name];
       if (!base) {
-        base = new Audio(`${ASSET_BASE}${name}.ogg`);
-        base.preload = "auto";
+        base = new Audio(ASSET_BASE + name + ".ogg");
         sfxCache[name] = base;
       }
-      const audio = base.cloneNode();
-      const p = audio.play();
-      if (p && typeof p.catch === "function") p.catch(() => {});
-    } catch {
-      
-    }
+      var a = base.cloneNode();
+      var p = a.play();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
   }
 
   function warmSfx() {
-    for (const name of ["join", "leave", "msg"]) {
-      if (sfxCache[name]) continue;
-      try {
-        const audio = new Audio(`${ASSET_BASE}${name}.ogg`);
-        audio.preload = "auto";
-        sfxCache[name] = audio;
-      } catch {
-        
+    ["join", "leave", "msg"].forEach(function (name) {
+      if (!sfxCache[name]) {
+        try {
+          sfxCache[name] = new Audio(ASSET_BASE + name + ".ogg");
+        } catch (e) {}
       }
-    }
+    });
   }
 
   const sanitize = (s) =>
@@ -136,14 +130,6 @@
     }
     const hue = Math.abs(h) % 360;
     return `hsl(${hue}, 65%, 45%)`;
-  }
-
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
   }
 
   const remoteCursors = new Map();
@@ -277,8 +263,9 @@
       entry.el.style.display = "none";
       return;
     }
-    entry.el.style.display = "";
-    entry.el.style.transform = `translate(${screen.x}px, ${screen.y}px)`;
+    entry.el.style.display = "block";
+    entry.el.style.left = screen.x + "px";
+    entry.el.style.top = screen.y + "px";
   }
 
   function refreshAllRemoteCursors() {
@@ -301,15 +288,15 @@
     let entry = remoteCursors.get(user);
     if (!entry) {
       const el = document.createElement("div");
-      el.className = "pl-live-cursor";
+      el.className = "pl-cur";
       el.style.display = "none";
-      el.innerHTML = `
-        <img class="pl-live-cursor-icon" src="${CURSOR_ICON}" alt="" draggable="false" />
-        <span class="pl-live-cursor-name"></span>
-      `;
-      const nameEl = el.querySelector(".pl-live-cursor-name");
+      const img = document.createElement("img");
+      img.src = CURSOR_ICON;
+      const nameEl = document.createElement("span");
       nameEl.textContent = user;
       nameEl.style.background = hashColor(user);
+      el.appendChild(img);
+      el.appendChild(nameEl);
       layer.appendChild(el);
       entry = { el, on: true, target: "", x: 0, y: 0 };
       remoteCursors.set(user, entry);
@@ -828,7 +815,6 @@
     if (!transport || !transport.connected) return;
     if (!force && Date.now() < suppressSendUntil) return;
     if (projectSyncBusy) {
-      // Retry once the in-flight sync finishes.
       clearTimeout(projectSyncTimer);
       projectSyncTimer = setTimeout(
         () => scheduleProjectSync(delayMs == null ? 700 : delayMs, force),
@@ -1421,9 +1407,6 @@
         } catch (e) {
           logWarn("remote extension load failed, trying blob", e);
         }
-        if (!source && url.indexOf("data:") === 0) {
-          // already data url
-        }
         if (source) {
           const blobUrl = URL.createObjectURL(
             new Blob([source], { type: "application/javascript" })
@@ -1463,7 +1446,6 @@
     for (const url of urls) {
       if (seen.has(url)) continue;
       seen.add(url);
-      // Builtin extension ids are not URLs > skip.
       if (
         !/^https?:\/\//i.test(url) &&
         !url.startsWith("data:") &&
@@ -1504,7 +1486,6 @@
     em.__pangliveExtHooked = true;
     const original = em.loadExtensionURL.bind(em);
     em.loadExtensionURL = function (url) {
-      // Prefetch blob/File contents before the editor revokes them.
       const shouldShare = !pauseEventHandling;
       const resolvedPromise = shouldShare
         ? resolveExtensionForShare(url)
@@ -1612,11 +1593,9 @@
       stopSpritePosPolling();
 
       const captured = wasPaused ? null : captureProjectInput(input);
-      // Prefer file-input capture if present; otherwise use loadProject argument.
       if (!wasPaused && captured && !pendingImportBuffer) {
         pendingImportBuffer = captured;
       } else if (!wasPaused && captured) {
-        // Keep whichever is larger (full zip vs maybe smaller arg).
         Promise.resolve(resolveCapturedProject(captured)).then((buf) => {
           if (
             buf &&
@@ -1634,7 +1613,6 @@
         refreshSpritePosFinger();
         if (transport && transport.connected) startSpritePosPolling();
         if (ok && !wasPaused && transport && transport.connected) {
-          // Wait for assets/extensions to settle, then push the real file bytes.
           setTimeout(() => {
             sharePendingOrSavedProject().catch((e) => {
               logErr("post-import project share failed", e);
@@ -1685,8 +1663,6 @@
     vm.on("PROJECT_LOADED", () => {
       hookWorkspaceListener();
       installExtensionHooks();
-      // Don't silence here if a forced project sync is pending > that used to
-      // cancel sharing after File > Load.
       if (!projectSyncBusy && !projectSyncTimer) {
         silenceOutbound(800);
       }
@@ -1818,7 +1794,6 @@
   }
 
   async function loadProjectBytes(buf) {
-    // vm.loadProject is hooked; pause before call so it won't schedule a re-sync.
     pauseEventHandling = true;
     silenceOutbound(4000);
     dirtyTargets.clear();
@@ -1944,7 +1919,6 @@
       });
       for (let i = 0; i < parts; i++) {
         const slice = bytes.subarray(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-        // Standalone copy so PeerJS/MessagePack owns the memory.
         const chunk = new Uint8Array(slice.length);
         chunk.set(slice);
         const ok = t.broadcast({
@@ -1987,14 +1961,12 @@
     }
     if (Array.isArray(data)) return new Uint8Array(data);
     if (typeof data === "string") {
-      // Legacy base64 chunk
       try {
         return new Uint8Array(base64ToBuf(data));
       } catch {
         return null;
       }
     }
-    // MessagePack sometimes decodes as object with numeric keys
     if (typeof data === "object" && data !== null) {
       if (typeof data.length === "number") {
         try {
@@ -2513,8 +2485,6 @@
       this._handlePayload(payload, fromConn);
 
       if (this.isHost && fromConn) {
-        // Don't amplify keepalive storms more than needed; still relay pings
-        // so guests can see each other.
         this.broadcast(payload, fromConn);
       }
     }
@@ -2533,7 +2503,7 @@
         username: this.username,
         isHost,
       });
-      this._status("connecting", "Loading PeerJS…");
+      this._status("connecting", "Loading PeerJS...");
 
       try {
         await loadPeerJS();
@@ -2544,7 +2514,7 @@
       }
       if (gen !== this._gen) return;
 
-      this._status("connecting", "Connecting…");
+      this._status("connecting", "Connecting...");
       const hostId = roomPeerId(this.room);
 
       let peer;
@@ -2575,7 +2545,7 @@
           return;
         }
 
-        this._status("connecting", "Joining host…");
+        this._status("connecting", "Joining host...");
         const conn = peer.connect(hostId, {
           reliable: true,
           serialization: "binary",
@@ -2700,280 +2670,270 @@
 
   function injectStyles() {
     if (document.getElementById("panglive-styles")) return;
-    const style = document.createElement("style");
+    var style = document.createElement("style");
     style.id = "panglive-styles";
     style.textContent = `
-      #panglive-window {
-        position: fixed; right: 12px; bottom: 12px; z-index: 10050;
-        width: 240px; max-width: calc(100vw - 24px);
-        font-family: system-ui, sans-serif;
-        background: #fff;
-        border: 1px solid #ccc;
-        border-radius: 8px;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.12);
-        color: #111;
-      }
-      #panglive-window.hidden { display: none; }
-      #panglive-window.collapsed .pl-body { display: none; }
-      .pl-bar {
-        display: flex; align-items: center; gap: 6px;
-        padding: 8px 10px; background: #222; color: #fff;
-        cursor: grab; user-select: none; border-radius: 8px 8px 0 0;
-      }
-      .pl-bar:active { cursor: grabbing; }
-      .pl-title { flex: 1; font-size: 13px; font-weight: 600; color: #fff; }
-      .pl-x {
-        border: none; background: transparent; color: #fff;
-        font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px;
-      }
-      .pl-body { padding: 12px; color: #111; }
-      .pl-row { display: flex; flex-direction: column; gap: 8px; }
-      .pl-row.hidden { display: none; }
-      .pl-hint { font-size: 12px; color: #333; }
-      .pl-label { font-size: 12px; font-weight: 600; color: #111; }
-      .pl-code {
-        font-size: 28px; font-weight: 700; letter-spacing: 0.18em;
-        text-align: center; font-family: ui-monospace, monospace;
-        color: #111;
-      }
-      .pl-input {
-        width: 100%; box-sizing: border-box; padding: 8px;
-        border: 1px solid #999; border-radius: 6px;
-        font-size: 14px; font-weight: 600; text-align: center;
-        color: #111; background: #fff;
-      }
-      .pl-input.pl-room-input {
-        font-size: 18px; letter-spacing: 0.2em; text-transform: uppercase;
-      }
-      .pl-btn {
-        width: 100%; padding: 8px; border: none; border-radius: 6px;
-        font-size: 13px; font-weight: 600; cursor: pointer;
-        background: #222; color: #fff;
-      }
-      .pl-btn.secondary { background: #e8e8e8; color: #111; }
-      .pl-status { font-size: 11px; color: #444; min-height: 14px; }
-      .pl-status.error { color: #b00020; }
-      .pl-online {
-        display: none; align-items: center; gap: 6px; flex-wrap: wrap;
-        margin-bottom: 8px; color: #111;
-      }
-      #panglive-window.connected .pl-online { display: flex; }
-      #panglive-window.connected .pl-form { display: none; }
-      .pl-online-label { font-size: 12px; font-weight: 700; color: #111; }
-      .pl-avatars { display: flex; position: relative; }
-      .pl-avatar {
-        position: relative;
-        width: 22px; height: 22px; border-radius: 50%;
-        margin-left: -4px; display: flex; align-items: center;
-        justify-content: center; color: #fff; font-size: 10px;
-        font-weight: 700; border: 1px solid #fff;
-      }
-      .pl-avatar:first-child { margin-left: 0; }
-      .pl-avatar::after {
-        content: attr(data-name);
-        position: absolute; left: 50%; bottom: calc(100% + 6px);
-        transform: translateX(-50%);
-        padding: 2px 6px; border-radius: 4px;
-        background: #222; color: #fff;
-        font-size: 11px; font-weight: 600; line-height: 1.3;
-        white-space: nowrap; pointer-events: none;
-        opacity: 0; visibility: hidden;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.25);
-        z-index: 2;
-      }
-      .pl-avatar:hover::after {
-        opacity: 1; visibility: visible;
-      }
-      .pl-leave {
-        margin-left: auto; border: none; background: transparent;
-        color: #b00020; font-size: 12px; font-weight: 600; cursor: pointer;
-      }
-      .pl-chat {
-        display: none; flex-direction: column; gap: 6px;
-        margin-top: 10px; border-top: 1px solid #ddd; padding-top: 10px;
-      }
-      #panglive-window.connected .pl-chat { display: flex; }
-      .pl-chat-list {
-        display: flex; flex-direction: column; gap: 4px;
-        min-height: 72px; max-height: 140px;
-        overflow-x: hidden; overflow-y: auto;
-        overscroll-behavior: contain;
-      }
-      .pl-chat-empty { font-size: 11px; color: #666; }
-      .pl-chat-line {
-        font-size: 11px; line-height: 1.3; color: #111;
-        word-break: break-word;
-      }
-      .pl-chat-line b { color: #222; }
-      .pl-chat-line.system {
-        color: #666; font-style: italic;
-      }
-      .pl-chat-typing {
-        min-height: 14px; font-size: 11px; color: #666;
-        font-style: italic;
-      }
-      .pl-chat-send { display: flex; gap: 6px; }
-      .pl-chat-send .pl-input {
-        flex: 1; font-size: 12px; font-weight: 500; text-align: left;
-        letter-spacing: normal; text-transform: none;
-      }
-      .pl-chat-send .pl-btn {
-        width: auto; padding: 8px 10px; flex-shrink: 0;
-      }
-      #panglive-cursors {
-        position: fixed; inset: 0; z-index: 10040;
-        pointer-events: none; overflow: hidden;
-      }
-      .pl-live-cursor {
-        position: absolute; left: 0; top: 0;
-        display: flex; flex-direction: column; align-items: flex-start;
-        gap: 2px; will-change: transform;
-        transition: transform 0.05s linear;
-      }
-      .pl-live-cursor-icon {
-        width: 28px; height: 28px; display: block;
-        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.35));
-      }
-      .pl-live-cursor-name {
-        max-width: 96px; padding: 1px 6px;
-        border-radius: 4px; color: #fff;
-        font-size: 11px; font-weight: 700; line-height: 1.4;
-        font-family: system-ui, sans-serif;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.2);
-        transform: translateX(-35%);
-      }
-    `;
+#panglive-window {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 10050;
+  width: 220px;
+  background: #ffffff;
+  border: 1px solid #888;
+  font: 12px Arial, sans-serif;
+  color: #111111;
+}
+#panglive-window .pl-bar {
+  background: #4C97FF;
+  color: #ffffff;
+  padding: 6px 8px;
+  cursor: move;
+  user-select: none;
+}
+#panglive-window .pl-bar button {
+  float: right;
+  border: 1px solid #ccc;
+  background: #ffffff;
+  color: #111111;
+  font-size: 11px;
+  padding: 0 5px;
+  cursor: pointer;
+}
+#panglive-window .pl-body {
+  padding: 8px;
+  background: #ffffff;
+  color: #111111;
+}
+#panglive-window label {
+  display: block;
+  margin: 4px 0 2px;
+  color: #111111;
+}
+#panglive-window input[type=text] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px;
+  border: 1px solid #999;
+  background: #ffffff;
+  color: #111111;
+  font: 12px Arial, sans-serif;
+}
+#panglive-window input[type=text]::placeholder {
+  color: #777777;
+}
+#panglive-window button.pl-btn {
+  width: 100%;
+  margin-top: 5px;
+  padding: 5px;
+  border: 1px solid #777;
+  background: #eeeeee;
+  color: #111111;
+  font: 12px Arial, sans-serif;
+  cursor: pointer;
+}
+#panglive-window button.pl-btn:hover {
+  background: #dddddd;
+  color: #111111;
+}
+#panglive-window .pl-status {
+  margin-top: 5px;
+  color: #444444;
+  min-height: 14px;
+}
+#panglive-window .pl-status.err {
+  color: #cc0000;
+}
+#panglive-window .pl-who {
+  margin-bottom: 6px;
+  word-break: break-word;
+  color: #111111;
+}
+#panglive-window .pl-room {
+  font: bold 18px Consolas, monospace;
+  letter-spacing: 2px;
+  text-align: center;
+  margin: 4px 0;
+  color: #111111;
+}
+#panglive-window .pl-leave {
+  border: none;
+  background: transparent;
+  color: #cc0000;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+  margin-top: 4px;
+}
+#panglive-window .pl-chat {
+  margin-top: 6px;
+  border-top: 1px solid #ccc;
+  padding-top: 6px;
+}
+#panglive-window #pl-log {
+  width: 100%;
+  height: 110px;
+  box-sizing: border-box;
+  border: 1px solid #999;
+  background: #ffffff;
+  color: #111111;
+  padding: 4px;
+  font: 11px Consolas, monospace;
+  resize: vertical;
+}
+#panglive-window .pl-sendrow {
+  margin-top: 4px;
+}
+#panglive-window .pl-sendrow input {
+  width: 70%;
+}
+#panglive-window .pl-sendrow button {
+  width: auto;
+  margin-top: 0;
+  margin-left: 4px;
+  padding: 4px 8px;
+}
+#panglive-window #pl-typing {
+  display: block;
+  height: 14px;
+  color: #555555;
+  font-size: 11px;
+}
+#panglive-cursors {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 10040;
+  pointer-events: none;
+}
+.pl-cur {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+.pl-cur img {
+  display: block;
+  width: 22px;
+  height: 22px;
+}
+.pl-cur span {
+  display: inline-block;
+  margin-top: 1px;
+  padding: 1px 4px;
+  color: #ffffff;
+  font: 10px Arial, sans-serif;
+  max-width: 90px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+`;
     document.head.appendChild(style);
   }
 
-  function makeDraggable(handle, element) {
-    let dragging = false;
-    let offsetX = 0;
-    let offsetY = 0;
-
-    handle.addEventListener("mousedown", (e) => {
-      if (e.button !== 0 || e.target.closest(".pl-x")) return;
-      dragging = true;
-      const rect = element.getBoundingClientRect();
-      offsetX = e.clientX - rect.left;
-      offsetY = e.clientY - rect.top;
-      element.style.left = `${rect.left}px`;
-      element.style.top = `${rect.top}px`;
-      element.style.right = "auto";
-      element.style.bottom = "auto";
+  function makeDraggable(bar, win) {
+    var drag = false;
+    var ox = 0;
+    var oy = 0;
+    bar.onmousedown = function (e) {
+      if (e.target.tagName === "BUTTON") return;
+      drag = true;
+      var r = win.getBoundingClientRect();
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
+      win.style.left = r.left + "px";
+      win.style.top = r.top + "px";
+      win.style.right = "auto";
+      win.style.bottom = "auto";
       e.preventDefault();
+    };
+    document.addEventListener("mousemove", function (e) {
+      if (!drag) return;
+      var x = Math.max(0, Math.min(e.clientX - ox, window.innerWidth - 80));
+      var y = Math.max(0, Math.min(e.clientY - oy, window.innerHeight - 40));
+      win.style.left = x + "px";
+      win.style.top = y + "px";
     });
-
-    document.addEventListener("mousemove", (e) => {
-      if (!dragging) return;
-      const x = Math.max(0, Math.min(e.clientX - offsetX, window.innerWidth - 80));
-      const y = Math.max(0, Math.min(e.clientY - offsetY, window.innerHeight - 40));
-      element.style.left = `${x}px`;
-      element.style.top = `${y}px`;
-    });
-
-    document.addEventListener("mouseup", () => {
-      dragging = false;
+    document.addEventListener("mouseup", function () {
+      drag = false;
     });
   }
 
   function createUI() {
     injectStyles();
 
-    const win = document.createElement("div");
+    var win = document.createElement("div");
     win.id = "panglive-window";
-    win.innerHTML = `
-      <div class="pl-bar">
-        <span class="pl-title">PangLive</span>
-        <button class="pl-x" id="pl-close" title="Close">×</button>
-      </div>
-      <div class="pl-body">
-        <div class="pl-online">
-          <span class="pl-online-label">Online</span>
-          <div class="pl-avatars" id="pl-avatars"></div>
-          <button class="pl-leave" id="pl-leave">Leave</button>
-        </div>
-        <div class="pl-row hidden" id="pl-room">
-          <div class="pl-label">Room code</div>
-          <div class="pl-code" id="pl-room-code">----</div>
-        </div>
-        <div class="pl-chat" id="pl-chat">
-          <div class="pl-label">Chat</div>
-          <div class="pl-chat-list" id="pl-chat-list">
-            <div class="pl-chat-empty">No messages yet</div>
-          </div>
-          <div class="pl-chat-typing" id="pl-chat-typing"></div>
-          <div class="pl-chat-send">
-            <input id="pl-chat-input" class="pl-input" maxlength="200" placeholder="Message…" />
-            <button class="pl-btn" id="pl-chat-go">Send</button>
-          </div>
-        </div>
-        <div class="pl-form" id="pl-form">
-          <div class="pl-row" id="pl-home">
-            <div class="pl-label">Username</div>
-            <input id="pl-username" class="pl-input" maxlength="16" placeholder="your name" />
-            <button class="pl-btn" id="pl-create">Create room</button>
-            <button class="pl-btn secondary" id="pl-join">Join room</button>
-          </div>
-          <div class="pl-row hidden" id="pl-join-panel">
-            <div class="pl-label">Room code</div>
-            <input id="pl-code" class="pl-input pl-room-input" maxlength="4" placeholder="A1B2" />
-            <button class="pl-btn" id="pl-join-go">Join</button>
-            <button class="pl-btn secondary" id="pl-back">Back</button>
-          </div>
-          <div class="pl-status" id="pl-status"></div>
-        </div>
-      </div>
-    `;
+    win.innerHTML =
+      '<div class="pl-bar" id="pl-bar">PangLive' +
+      '<button type="button" id="pl-close">x</button></div>' +
+      '<div class="pl-body">' +
+      '<div class="pl-who" id="pl-who" style="display:none">' +
+      "<label>Room</label>" +
+      '<div class="pl-room" id="pl-room">----</div>' +
+      "Online: <span id=\"pl-users\"></span><br>" +
+      '<button type="button" class="pl-leave" id="pl-leave">Leave</button></div>' +
+      '<div class="pl-chat" id="pl-chat" style="display:none">' +
+      "<label>Chat</label>" +
+      '<textarea id="pl-log" readonly></textarea>' +
+      '<span id="pl-typing"></span>' +
+      '<div class="pl-sendrow">' +
+      '<input id="pl-msg" type="text" maxlength="200" placeholder="message">' +
+      '<button type="button" class="pl-btn" id="pl-send">Send</button></div></div>' +
+      '<div id="pl-form">' +
+      '<div id="pl-home">' +
+      "<label>Username</label>" +
+      '<input id="pl-user" type="text" maxlength="16">' +
+      '<button type="button" class="pl-btn" id="pl-create">Create room</button>' +
+      '<button type="button" class="pl-btn" id="pl-join">Join room</button></div>' +
+      '<div id="pl-joinbox" style="display:none">' +
+      "<label>Room code</label>" +
+      '<input id="pl-code" type="text" maxlength="4" placeholder="A1B2">' +
+      '<button type="button" class="pl-btn" id="pl-join-go">Join</button>' +
+      '<button type="button" class="pl-btn" id="pl-back">Back</button></div>' +
+      '<div class="pl-status" id="pl-status"></div></div></div>';
 
     document.body.appendChild(win);
 
-    const home = win.querySelector("#pl-home");
-    const joinPanel = win.querySelector("#pl-join-panel");
-    const statusEl = win.querySelector("#pl-status");
-    const usernameInput = win.querySelector("#pl-username");
-    const codeInput = win.querySelector("#pl-code");
-    const roomCodeEl = win.querySelector("#pl-room-code");
-    const roomBlock = win.querySelector("#pl-room");
-    const chatList = win.querySelector("#pl-chat-list");
-    const chatInput = win.querySelector("#pl-chat-input");
-    const chatTypingEl = win.querySelector("#pl-chat-typing");
-    const titlebar = win.querySelector(".pl-bar");
-    const chatMessages = [];
-    const typingUsers = new Map();
-    let typingTimer = null;
-    let knownUsers = new Set();
-    let presenceSeeded = false;
+    var home = win.querySelector("#pl-home");
+    var joinbox = win.querySelector("#pl-joinbox");
+    var statusEl = win.querySelector("#pl-status");
+    var userInput = win.querySelector("#pl-user");
+    var codeInput = win.querySelector("#pl-code");
+    var roomEl = win.querySelector("#pl-room");
+    var usersEl = win.querySelector("#pl-users");
+    var who = win.querySelector("#pl-who");
+    var chat = win.querySelector("#pl-chat");
+    var form = win.querySelector("#pl-form");
+    var logEl = win.querySelector("#pl-log");
+    var msgInput = win.querySelector("#pl-msg");
+    var typingEl = win.querySelector("#pl-typing");
+    var lines = [];
+    var typingUsers = new Map();
+    var typingTimer = null;
+    var knownUsers = new Set();
+    var presenceSeeded = false;
 
-    usernameInput.value = randomUsername();
-    makeDraggable(titlebar, win);
+    userInput.value = randomUsername();
+    makeDraggable(win.querySelector("#pl-bar"), win);
     warmSfx();
 
+    function setConnected(on) {
+      who.style.display = on ? "block" : "none";
+      chat.style.display = on ? "block" : "none";
+      form.style.display = on ? "none" : "block";
+    }
+
     function renderTyping() {
-      const names = [...typingUsers.keys()];
-      if (names.length === 0) {
-        chatTypingEl.textContent = "";
-        return;
-      }
-      if (names.length === 1) {
-        chatTypingEl.textContent = `${names[0]} is typing…`;
-        return;
-      }
-      if (names.length === 2) {
-        chatTypingEl.textContent = `${names[0]} and ${names[1]} are typing…`;
-        return;
-      }
-      chatTypingEl.textContent = `${names.length} people are typing…`;
+      var names = Array.from(typingUsers.keys());
+      typingEl.textContent = names.length ? names.join(", ") + " typing..." : "";
     }
 
     function setRemoteTyping(user, on) {
       if (!user) return;
-      if (on) {
-        typingUsers.set(user, Date.now());
-      } else {
-        typingUsers.delete(user);
-      }
+      if (on) typingUsers.set(user, Date.now());
+      else typingUsers.delete(user);
       renderTyping();
     }
 
@@ -2988,200 +2948,166 @@
     }
 
     function renderChat() {
-      const nearBottom =
-        chatList.scrollHeight - chatList.scrollTop - chatList.clientHeight < 36;
-      if (chatMessages.length === 0) {
-        chatList.innerHTML = `<div class="pl-chat-empty">No messages yet</div>`;
-        return;
+      var t = "";
+      for (var i = 0; i < lines.length; i++) {
+        if (lines[i].system) t += "* " + lines[i].text + "\n";
+        else t += lines[i].user + ": " + lines[i].text + "\n";
       }
-      chatList.innerHTML = chatMessages
-        .map((m) => {
-          if (m.system) {
-            return `<div class="pl-chat-line system">${escapeHtml(m.text)}</div>`;
-          }
-          return `<div class="pl-chat-line"><b>${escapeHtml(m.user)}</b>: ${escapeHtml(m.text)}</div>`;
-        })
-        .join("");
-      if (nearBottom) chatList.scrollTop = chatList.scrollHeight;
+      logEl.value = t;
+      logEl.scrollTop = logEl.scrollHeight;
     }
 
     function pushChat(user, text) {
       typingUsers.delete(user);
       renderTyping();
-      chatMessages.push({ user, text });
-      while (chatMessages.length > CHAT_HISTORY) chatMessages.shift();
+      lines.push({ user: user, text: text });
+      while (lines.length > CHAT_HISTORY) lines.shift();
       renderChat();
       playSfx("msg");
     }
 
     function pushSystem(text) {
-      chatMessages.push({ system: true, text });
-      while (chatMessages.length > CHAT_HISTORY) chatMessages.shift();
+      lines.push({ system: true, text: text });
+      while (lines.length > CHAT_HISTORY) lines.shift();
       renderChat();
     }
 
     function clearChat() {
-      chatMessages.length = 0;
+      lines.length = 0;
       clearTyping();
       renderChat();
     }
 
     function getUsername() {
-      const name = sanitize(usernameInput.value).replace(/\s+/g, "").slice(0, 16);
+      var name = sanitize(userInput.value).replace(/\s+/g, "").slice(0, 16);
       if (name && name !== "user") return name;
-      const fallback = randomUsername();
-      usernameInput.value = fallback;
-      return fallback;
+      userInput.value = randomUsername();
+      return userInput.value;
     }
 
     function sendChatMessage() {
-      const payload = transport.sendChat(chatInput.value);
+      var payload = transport.sendChat(msgInput.value);
       if (!payload) return;
       pushChat(payload.user, payload.text);
-      chatInput.value = "";
-      chatInput.focus();
+      msgInput.value = "";
     }
 
     function noteLocalTyping() {
       if (!transport.connected) return;
       transport.sendTyping(true);
       if (typingTimer) clearTimeout(typingTimer);
-      typingTimer = setTimeout(() => {
+      typingTimer = setTimeout(function () {
         typingTimer = null;
         transport.sendTyping(false);
       }, TYPING_IDLE_MS);
     }
 
-    win.querySelector("#pl-close").addEventListener("click", () => {
-      win.classList.add("hidden");
-    });
+    win.querySelector("#pl-close").onclick = function () {
+      win.style.display = "none";
+    };
 
-    win.querySelector("#pl-create").addEventListener("click", () => {
+    win.querySelector("#pl-create").onclick = function () {
       warmSfx();
-      const code = randomRoomCode();
-      roomCodeEl.textContent = code;
+      var code = randomRoomCode();
+      roomEl.textContent = code;
       statusEl.className = "pl-status";
-      statusEl.textContent = "Creating…";
+      statusEl.textContent = "creating...";
       transport.connect(code, getUsername(), true);
-    });
+    };
 
-    win.querySelector("#pl-join").addEventListener("click", () => {
-      home.classList.add("hidden");
-      joinPanel.classList.remove("hidden");
+    win.querySelector("#pl-join").onclick = function () {
+      home.style.display = "none";
+      joinbox.style.display = "block";
       codeInput.value = "";
       codeInput.focus();
-    });
+    };
 
-    win.querySelector("#pl-back").addEventListener("click", () => {
-      joinPanel.classList.add("hidden");
-      home.classList.remove("hidden");
+    win.querySelector("#pl-back").onclick = function () {
+      joinbox.style.display = "none";
+      home.style.display = "block";
       statusEl.textContent = "";
       statusEl.className = "pl-status";
-    });
+    };
 
-    codeInput.addEventListener("input", () => {
+    codeInput.oninput = function () {
       codeInput.value = codeInput.value
         .toUpperCase()
         .replace(/[^A-Z0-9]/g, "")
         .slice(0, 4);
-    });
+    };
 
-    codeInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") win.querySelector("#pl-join-go").click();
-    });
-
-    win.querySelector("#pl-join-go").addEventListener("click", () => {
-      const code = sanitize(codeInput.value).toUpperCase();
+    win.querySelector("#pl-join-go").onclick = function () {
+      var code = sanitize(codeInput.value).toUpperCase();
       if (code.length !== 4) {
-        statusEl.textContent = "Code must be 4 characters.";
-        statusEl.className = "pl-status error";
+        statusEl.textContent = "need 4 chars";
+        statusEl.className = "pl-status err";
         return;
       }
       warmSfx();
       statusEl.className = "pl-status";
-      statusEl.textContent = "Joining…";
+      statusEl.textContent = "joining...";
       transport.connect(code, getUsername(), false);
-    });
+    };
 
-    win.querySelector("#pl-leave").addEventListener("click", () => {
+    win.querySelector("#pl-leave").onclick = function () {
       transport.disconnect();
-      win.classList.remove("connected", "collapsed");
-      roomBlock.classList.add("hidden");
-      joinPanel.classList.add("hidden");
-      home.classList.remove("hidden");
+      setConnected(false);
+      joinbox.style.display = "none";
+      home.style.display = "block";
       statusEl.textContent = "";
-      statusEl.className = "pl-status";
+      usersEl.textContent = "";
       clearChat();
-    });
+    };
 
-    win.querySelector("#pl-chat-go").addEventListener("click", sendChatMessage);
-    chatInput.addEventListener("keydown", (e) => {
+    win.querySelector("#pl-send").onclick = sendChatMessage;
+    msgInput.onkeydown = function (e) {
       if (e.key === "Enter") sendChatMessage();
-    });
-    chatInput.addEventListener("input", noteLocalTyping);
-    chatList.addEventListener(
-      "wheel",
-      (e) => {
-        e.stopPropagation();
-      },
-      { passive: true }
-    );
+    };
+    msgInput.oninput = noteLocalTyping;
 
     transport.setHandlers({
-      onPresence: (users) => {
-        const avatars = win.querySelector("#pl-avatars");
-        avatars.innerHTML = "";
-        users.slice(0, 8).forEach((name) => {
-          const el = document.createElement("div");
-          el.className = "pl-avatar";
-          el.dataset.name = name;
-          el.style.background = hashColor(name);
-          el.textContent = name.slice(0, 1);
-          avatars.appendChild(el);
+      onPresence: function (users) {
+        usersEl.textContent = users.join(", ") || "-";
+        Array.from(typingUsers.keys()).forEach(function (name) {
+          if (users.indexOf(name) === -1) typingUsers.delete(name);
         });
-        for (const name of [...typingUsers.keys()]) {
-          if (!users.includes(name)) typingUsers.delete(name);
-        }
         renderTyping();
         pruneRemoteCursors(users);
-
         if (!presenceSeeded) {
           knownUsers = new Set(users);
           presenceSeeded = true;
           return;
         }
-        for (const name of users) {
-          if (!knownUsers.has(name) && name !== transport.username) {
+        for (var i = 0; i < users.length; i++) {
+          if (!knownUsers.has(users[i]) && users[i] !== transport.username) {
             playSfx("join");
-            pushSystem(`${name} joined`);
+            pushSystem(users[i] + " joined");
           }
         }
-        for (const name of knownUsers) {
-          if (!users.includes(name) && name !== transport.username) {
+        knownUsers.forEach(function (name) {
+          if (users.indexOf(name) === -1 && name !== transport.username) {
             playSfx("leave");
-            pushSystem(`${name} left`);
+            pushSystem(name + " left");
           }
-        }
+        });
         knownUsers = new Set(users);
       },
-      onChat: ({ user, text }) => {
-        pushChat(user, text);
+      onChat: function (m) {
+        pushChat(m.user, m.text);
       },
-      onTyping: ({ user, on }) => {
-        setRemoteTyping(user, on);
+      onTyping: function (m) {
+        setRemoteTyping(m.user, m.on);
       },
-      onStatus: (state, detail) => {
+      onStatus: function (state, detail) {
         statusEl.textContent = detail || "";
-        statusEl.className = "pl-status" + (state === "error" ? " error" : "");
+        statusEl.className = "pl-status" + (state === "error" ? " err" : "");
         if (state === "connected") {
-          win.classList.add("connected");
-          roomCodeEl.textContent = transport.room.toUpperCase();
-          roomBlock.classList.remove("hidden");
+          setConnected(true);
+          roomEl.textContent = transport.room.toUpperCase();
           presenceSeeded = false;
           knownUsers = new Set();
         } else if (state === "idle" || state === "error") {
-          win.classList.remove("connected");
-          roomBlock.classList.add("hidden");
+          setConnected(false);
           clearChat();
           clearRemoteCursors();
           presenceSeeded = false;
@@ -3191,8 +3117,8 @@
     });
 
     return {
-      show() {
-        win.classList.remove("hidden", "collapsed");
+      show: function () {
+        win.style.display = "block";
       },
     };
   }
@@ -3202,8 +3128,8 @@
       return {
         id: "panglive",
         name: "PangLive",
-        color1: "#222222",
-        color2: "#111111",
+        color1: "#4C97FF",
+        color2: "#3373CC",
         blocks: [
           {
             opcode: "open",
@@ -3213,16 +3139,15 @@
         ],
       };
     }
-
     open() {
       ui.show();
     }
   }
 
-  const ui = createUI();
+  var ui = createUI();
   Scratch.extensions.register(new PangLiveExtension());
-
-  setTimeout(() => ui.show(), 1500);
+  setTimeout(function () {
+    ui.show();
+  }, 1500);
   installHooks();
-  log("PangLive loaded unsandboxed");
 })(Scratch);
